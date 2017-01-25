@@ -69,7 +69,7 @@ namespace swift {
   struct SILArgumentConvention;
   enum OptionalTypeKind : unsigned;
   enum PointerTypeKind : unsigned;
-  enum class ValueOwnershipKind : uint8_t;
+  struct ValueOwnershipKind;
 
   enum class TypeKind {
 #define TYPE(id, parent) id,
@@ -292,9 +292,10 @@ protected:
 
     unsigned ExpandedNestedTypes : 1;
     unsigned HasSuperclass : 1;
+    unsigned HasLayoutConstraint : 1;
     unsigned NumProtocols : 16;
   };
-  enum { NumArchetypeTypeBitfields = NumTypeBaseBits + 18 };
+  enum { NumArchetypeTypeBitfields = NumTypeBaseBits + 19 };
   static_assert(NumArchetypeTypeBitfields <= 32, "fits in an unsigned");
 
   struct TypeVariableTypeBitfields {
@@ -719,6 +720,12 @@ public:
   /// True if this type contains archetypes that could be substituted with
   /// concrete types to form the argument type.
   bool isBindableTo(Type ty, LazyResolver *resolver);
+
+  /// \brief Retrieve the layout constraint of this type.
+  ///
+  /// \returns The layout constraint of this type, or a null layout constraint
+  ///          if it has no layout constraint.
+  LayoutConstraint getLayoutConstraint();
 
   /// \brief Determines whether this type is permitted as a method override
   /// of the \p other.
@@ -1381,7 +1388,7 @@ class ParameterTypeFlags {
     NumBits = 3
   };
   OptionSet<ParameterFlags> value;
-  static_assert(NumBits < 8*sizeof(value), "overflowed");
+  static_assert(NumBits < 8*sizeof(OptionSet<ParameterFlags>), "overflowed");
 
   ParameterTypeFlags(OptionSet<ParameterFlags, uint8_t> val) : value(val) {}
 
@@ -2255,6 +2262,8 @@ inline bool canBeCalledIndirectly(SILFunctionTypeRepresentation rep) {
   case SILFunctionTypeRepresentation::WitnessMethod:
     return true;
   }
+
+  llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
 }
 
 /// Map a SIL function representation to the base language calling convention
@@ -2273,6 +2282,8 @@ getSILFunctionLanguage(SILFunctionTypeRepresentation rep) {
   case SILFunctionTypeRepresentation::Closure:
     return SILFunctionLanguage::Swift;
   }
+
+  llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
 }
 
 /// AnyFunctionType - A function type has a single input and result, but
@@ -2357,6 +2368,8 @@ public:
       case SILFunctionTypeRepresentation::WitnessMethod:
         return true;
       }
+
+      llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
     }
 
     /// True if the function representation carries context.
@@ -2373,6 +2386,8 @@ public:
       case SILFunctionTypeRepresentation::Closure:
         return false;
       }
+
+      llvm_unreachable("Unhandled SILFunctionTypeRepresentation in switch.");
     }
     
     // Note that we don't have setters. That is by design, use
@@ -2693,11 +2708,6 @@ enum class ParameterConvention {
   /// validity is guaranteed only at the instant the call begins.
   Direct_Unowned,
 
-  /// This argument is passed directly. Its type is non-trivial, and the callee
-  /// guarantees that the caller can treat the argument as being instantaneously
-  /// deallocated when the callee returns.
-  Direct_Deallocating,
-
   /// This argument is passed directly.  Its type is non-trivial, and the caller
   /// guarantees its validity for the entirety of the call.
   Direct_Guaranteed,
@@ -2714,7 +2724,6 @@ inline bool isIndirectParameter(ParameterConvention conv) {
   case ParameterConvention::Direct_Unowned:
   case ParameterConvention::Direct_Guaranteed:
   case ParameterConvention::Direct_Owned:
-  case ParameterConvention::Direct_Deallocating:
     return false;
   }
   llvm_unreachable("covered switch isn't covered?!");
@@ -2730,7 +2739,6 @@ inline bool isConsumedParameter(ParameterConvention conv) {
   case ParameterConvention::Direct_Unowned:
   case ParameterConvention::Direct_Guaranteed:
   case ParameterConvention::Indirect_In_Guaranteed:
-  case ParameterConvention::Direct_Deallocating:
     return false;
   }
   llvm_unreachable("bad convention kind");
@@ -2750,27 +2758,9 @@ inline bool isGuaranteedParameter(ParameterConvention conv) {
   case ParameterConvention::Indirect_In:
   case ParameterConvention::Direct_Unowned:
   case ParameterConvention::Direct_Owned:
-  case ParameterConvention::Direct_Deallocating:
     return false;
   }
   llvm_unreachable("bad convention kind");
-}
-
-inline bool isDeallocatingParameter(ParameterConvention conv) {
-  switch (conv) {
-  case ParameterConvention::Direct_Deallocating:
-    return true;
-
-  case ParameterConvention::Indirect_In:
-  case ParameterConvention::Indirect_Inout:
-  case ParameterConvention::Indirect_InoutAliasable:
-  case ParameterConvention::Indirect_In_Guaranteed:
-  case ParameterConvention::Direct_Unowned:
-  case ParameterConvention::Direct_Guaranteed:
-  case ParameterConvention::Direct_Owned:
-    return false;
-  }
-  llvm_unreachable("covered switch isn't covered?!");
 }
 
 /// A parameter type and the rules for passing it.
@@ -2816,13 +2806,6 @@ public:
   /// directly.
   bool isGuaranteed() const {
     return isGuaranteedParameter(getConvention());
-  }
-
-  /// Returns true if this parameter is deallocating. This means that the
-  /// deallocating bit has been set on the parameter. This means that retains,
-  /// releases are inert for the duration of the lifetime of the function.
-  bool isDeallocating() const {
-    return isDeallocatingParameter(getConvention());
   }
 
   SILType getSILType() const; // in SILType.h
@@ -2953,7 +2936,9 @@ public:
     return out;
   }
 
-  ValueOwnershipKind getOwnershipKind(SILModule &) const; // in SILType.cpp
+  ValueOwnershipKind
+  getOwnershipKind(SILModule &,
+                   CanGenericSignature sig = nullptr) const; // in SILType.cpp
 
   bool operator==(SILResultInfo rhs) const {
     return TypeAndConvention == rhs.TypeAndConvention;
@@ -3043,6 +3028,8 @@ public:
       case Representation::WitnessMethod:
         return true;
       }
+
+      llvm_unreachable("Unhandled Representation in switch.");
     }
 
     bool hasGuaranteedSelfParam() const {
@@ -3058,6 +3045,8 @@ public:
       case Representation::WitnessMethod:
         return true;
       }
+
+      llvm_unreachable("Unhandled Representation in switch.");
     }
 
     /// True if the function representation carries context.
@@ -3074,6 +3063,8 @@ public:
       case Representation::Closure:
         return false;
       }
+
+      llvm_unreachable("Unhandled Representation in switch.");
     }
     
     // Note that we don't have setters. That is by design, use
@@ -3794,7 +3785,8 @@ DEFINE_EMPTY_CAN_TYPE_WRAPPER(SubstitutableType, Type)
 /// associated types, as well as the runtime type stored within an
 /// existential container.
 class ArchetypeType final : public SubstitutableType,
-    private llvm::TrailingObjects<ArchetypeType, ProtocolDecl *, Type, UUID> {
+  private llvm::TrailingObjects<ArchetypeType, ProtocolDecl *,
+                                Type, LayoutConstraint, UUID> {
   friend TrailingObjects;
 
   size_t numTrailingObjects(OverloadToken<ProtocolDecl *>) const {
@@ -3803,6 +3795,10 @@ class ArchetypeType final : public SubstitutableType,
 
   size_t numTrailingObjects(OverloadToken<Type>) const {
     return ArchetypeTypeBits.HasSuperclass ? 1 : 0;
+  }
+
+  size_t numTrailingObjects(OverloadToken<LayoutConstraint>) const {
+    return ArchetypeTypeBits.HasLayoutConstraint ? 1 : 0;
   }
 
   size_t numTrailingObjects(OverloadToken<UUID>) const {
@@ -3825,7 +3821,7 @@ public:
                         getNew(const ASTContext &Ctx, ArchetypeType *Parent,
                                AssociatedTypeDecl *AssocType,
                                SmallVectorImpl<ProtocolDecl *> &ConformsTo,
-                               Type Superclass);
+                               Type Superclass, LayoutConstraint Layout);
 
   /// getNew - Create a new primary archetype with the given name.
   ///
@@ -3836,7 +3832,7 @@ public:
                                GenericEnvironment *genericEnvironment,
                                Identifier Name,
                                SmallVectorImpl<ProtocolDecl *> &ConformsTo,
-                               Type Superclass);
+                               Type Superclass, LayoutConstraint Layout);
 
   /// Create a new archetype that represents the opened type
   /// of an existential value.
@@ -3905,6 +3901,13 @@ public:
     if (!ArchetypeTypeBits.HasSuperclass) return Type();
 
     return *getTrailingObjects<Type>();
+  }
+
+  /// \brief Retrieve the layout constraint of this type, if such a requirement exists.
+  LayoutConstraint getLayoutConstraint() const {
+    if (!ArchetypeTypeBits.HasLayoutConstraint) return LayoutConstraint();
+
+    return *getTrailingObjects<LayoutConstraint>();
   }
 
   /// \brief Return true if the archetype has any requirements at all.
@@ -3989,11 +3992,11 @@ private:
             ParentOrGenericEnv,
           llvm::PointerUnion<AssociatedTypeDecl *, Identifier> AssocTypeOrName,
           ArrayRef<ProtocolDecl *> ConformsTo,
-          Type Superclass);
+          Type Superclass, LayoutConstraint Layout);
 
   ArchetypeType(const ASTContext &Ctx, Type Existential,
                 ArrayRef<ProtocolDecl *> ConformsTo, Type Superclass,
-                UUID uuid);
+                LayoutConstraint Layout, UUID uuid);
 };
 BEGIN_CAN_TYPE_WRAPPER(ArchetypeType, SubstitutableType)
 CanArchetypeType getParent() const {
@@ -4115,6 +4118,11 @@ public:
   Type substBaseType(ModuleDecl *M,
                      Type base,
                      LazyResolver *resolver = nullptr);
+
+  /// Substitute the base type, looking up our associated type in it if it is
+  /// non-dependent. Returns null if the member could not be found in the new
+  /// base.
+  Type substBaseType(Type base, LookupConformanceFn lookupConformance);
 
   // Implement isa/cast/dyncast/etc.
   static bool classof(const TypeBase *T) {

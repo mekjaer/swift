@@ -126,8 +126,7 @@ Action(llvm::cl::desc("Mode:"), llvm::cl::init(ActionType::None),
                      "Compare SDK content in JSON file"),
           clEnumValN(ActionType::DiagnoseSDKs,
                      "diagnose-sdk",
-                     "Diagnose SDK content in JSON file"),
-          clEnumValEnd));
+                     "Diagnose SDK content in JSON file")));
 
 static llvm::cl::list<std::string>
 SDKJsonPaths("input-paths",
@@ -1314,7 +1313,7 @@ public:
   }
 
 public:
-  void lookupVisibleDecls(ArrayRef<Module *> Modules) {
+  void lookupVisibleDecls(ArrayRef<ModuleDecl *> Modules) {
     for (auto M : Modules) {
       llvm::SmallVector<Decl*, 512> Decls;
       M->getDisplayDecls(Decls);
@@ -3355,7 +3354,7 @@ static int dumpSwiftModules(const CompilerInvocation &InitInvok,
     return 1;
   }
 
-  std::vector<Module*> Modules;
+  std::vector<ModuleDecl*> Modules;
   CompilerInvocation Invocation(InitInvok);
   CompilerInstance CI;
   // Display diagnostics to stderr.
@@ -3423,7 +3422,7 @@ static int dumpSDKContent(const CompilerInvocation &InitInvok,
     return 1;
   }
 
-  std::vector<Module *> Modules;
+  std::vector<ModuleDecl *> Modules;
   for (auto &Entry : ModuleNames) {
     StringRef Name = Entry.getKey();
     if (options::Verbose)

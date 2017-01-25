@@ -17,7 +17,9 @@
 #include "swift/AST/ArchetypeBuilder.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/Initializer.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Serialization/BCReadingExtras.h"
@@ -120,8 +122,8 @@ namespace {
           os << "with type " << getDataAs<Type>();
           break;
         case Kind::Extension:
-          if (getDataAs<Module *>())
-            os << "in an extension in module '" << getDataAs<Module *>()->getName()
+          if (getDataAs<ModuleDecl *>())
+            os << "in an extension in module '" << getDataAs<ModuleDecl *>()->getName()
                << "'";
           else
             os << "in an extension in any module";
@@ -184,11 +186,11 @@ namespace {
     };
 
   private:
-    Module &baseM;
+    ModuleDecl &baseM;
     SmallVector<PathPiece, 8> path;
 
   public:
-    PrettyXRefTrace(Module &M) : baseM(M) {}
+    PrettyXRefTrace(ModuleDecl &M) : baseM(M) {}
 
     void addValue(Identifier name) {
       path.push_back({ PathPiece::Kind::Value, name });
@@ -212,7 +214,7 @@ namespace {
                        static_cast<uintptr_t>(kind) });
     }
 
-    void addExtension(Module *M) {
+    void addExtension(ModuleDecl *M) {
       path.push_back({ PathPiece::Kind::Extension, M });
     }
 
@@ -911,6 +913,61 @@ void ModuleFile::readGenericRequirements(
       }
       break;
       }
+    case LAYOUT_REQUIREMENT: {
+      uint8_t rawKind;
+      uint64_t rawTypeID;
+      uint32_t size;
+      uint32_t alignment;
+      LayoutRequirementLayout::readRecord(scratch, rawKind, rawTypeID,
+                                          size, alignment);
+
+      auto first = getType(rawTypeID);
+      LayoutConstraintInfo layoutInfo;
+      LayoutConstraintKind kind = LayoutConstraintKind::UnknownLayout;
+      switch (rawKind) {
+      default: {
+        // Unknown layout requirement kind.
+        error();
+        break;
+      }
+      case LayoutRequirementKind::NativeRefCountedObject: {
+        kind = LayoutConstraintKind::NativeRefCountedObject;
+        break;
+      }
+      case LayoutRequirementKind::RefCountedObject: {
+        kind = LayoutConstraintKind::RefCountedObject;
+        break;
+      }
+      case LayoutRequirementKind::Trivial: {
+        kind = LayoutConstraintKind::Trivial;
+        break;
+      }
+      case LayoutRequirementKind::TrivialOfExactSize: {
+        kind = LayoutConstraintKind::TrivialOfExactSize;
+        break;
+      }
+      case LayoutRequirementKind::TrivialOfAtMostSize: {
+        kind = LayoutConstraintKind::TrivialOfAtMostSize;
+        break;
+      }
+      case LayoutRequirementKind::UnknownLayout: {
+        kind = LayoutConstraintKind::UnknownLayout;
+        break;
+      }
+      }
+
+      if (kind != LayoutConstraintKind::TrivialOfAtMostSize &&
+          kind != LayoutConstraintKind::TrivialOfExactSize)
+        layoutInfo = LayoutConstraintInfo(kind);
+      else
+        layoutInfo = LayoutConstraintInfo(kind, size, alignment);
+
+      auto layout = getContext().AllocateObjectCopy(layoutInfo);
+
+      requirements.push_back(
+          Requirement(RequirementKind::Layout, first, layout));
+      break;
+      }
     default:
       // This record is not part of the GenericParamList.
       shouldContinue = false;
@@ -1198,7 +1255,7 @@ getActualCtorInitializerKind(uint8_t raw) {
 /// Any of \p expectedTy, \p expectedModule, or \p expectedGenericSig can be
 /// omitted, in which case any type or module is accepted. Values imported
 /// from Clang can also appear in any module.
-static void filterValues(Type expectedTy, Module *expectedModule,
+static void filterValues(Type expectedTy, ModuleDecl *expectedModule,
                          CanGenericSignature expectedGenericSig, bool isType,
                          bool inProtocolExt,
                          Optional<swift::CtorInitializerKind> ctorInit,
@@ -1256,7 +1313,7 @@ static void filterValues(Type expectedTy, Module *expectedModule,
   values.erase(newEnd, values.end());
 }
 
-Decl *ModuleFile::resolveCrossReference(Module *M, uint32_t pathLen) {
+Decl *ModuleFile::resolveCrossReference(ModuleDecl *M, uint32_t pathLen) {
   using namespace decls_block;
   assert(M && "missing dependency");
   PrettyXRefTrace pathTrace(*M);
@@ -1787,7 +1844,7 @@ DeclContext *ModuleFile::getDeclContext(DeclContextID DCID) {
   return declContextOrOffset;
 }
 
-Module *ModuleFile::getModule(ModuleID MID) {
+ModuleDecl *ModuleFile::getModule(ModuleID MID) {
   if (MID < NUM_SPECIAL_MODULES) {
     switch (static_cast<SpecialModuleID>(static_cast<uint8_t>(MID))) {
     case BUILTIN_MODULE_ID:
@@ -1806,7 +1863,7 @@ Module *ModuleFile::getModule(ModuleID MID) {
   return getModule(getIdentifier(MID));
 }
 
-Module *ModuleFile::getModule(ArrayRef<Identifier> name) {
+ModuleDecl *ModuleFile::getModule(ArrayRef<Identifier> name) {
   if (name.empty() || name.front().empty())
     return getContext().TheBuiltinModule;
 
@@ -2252,7 +2309,9 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
         Attr = new (ctx) AvailableAttr(
           SourceLoc(), SourceRange(),
           (PlatformKind)platform, message, rename,
-          Introduced, Deprecated, Obsoleted,
+          Introduced, SourceRange(),
+          Deprecated, SourceRange(),
+          Obsoleted, SourceRange(),
           platformAgnostic, isImplicit);
         break;
 
@@ -2293,16 +2352,23 @@ Decl *ModuleFile::getDecl(DeclID DID, Optional<DeclContext *> ForcedContext) {
       }
 
       case decls_block::Specialize_DECL_ATTR: {
-        ArrayRef<uint64_t> rawTypeIDs;
-        serialization::decls_block::SpecializeDeclAttrLayout::readRecord(
-          scratch, rawTypeIDs);
+        unsigned exported;
+        SpecializeAttr::SpecializationKind specializationKind;
+        unsigned specializationKindVal;
+        SmallVector<Requirement, 8> requirements;
 
-        SmallVector<TypeLoc, 8> typeLocs;
-        for (auto tid : rawTypeIDs)
-          typeLocs.push_back(TypeLoc::withoutLoc(getType(tid)));
+        serialization::decls_block::SpecializeDeclAttrLayout::readRecord(
+          scratch, exported, specializationKindVal);
+
+        specializationKind = specializationKindVal
+                                 ? SpecializeAttr::SpecializationKind::Partial
+                                 : SpecializeAttr::SpecializationKind::Full;
+
+        readGenericRequirements(requirements, DeclTypeCursor);
 
         Attr = SpecializeAttr::create(ctx, SourceLoc(), SourceRange(),
-                                      typeLocs);
+                                      requirements, exported != 0,
+                                      specializationKind);
         break;
       }
 
@@ -3477,7 +3543,6 @@ Optional<swift::ParameterConvention> getActualParameterConvention(uint8_t raw) {
   CASE(Direct_Owned)
   CASE(Direct_Unowned)
   CASE(Direct_Guaranteed)
-  CASE(Direct_Deallocating)
 #undef CASE
   }
   return None;
@@ -3748,6 +3813,9 @@ Type ModuleFile::getType(TypeID TID) {
     Type superclass;
     superclass = getType(superclassID);
 
+    // TODO: Read layout.
+    LayoutConstraint layout;
+
     SmallVector<ProtocolDecl *, 4> conformances;
     for (DeclID protoID : rawConformanceIDs)
       conformances.push_back(cast<ProtocolDecl>(getDecl(protoID)));
@@ -3760,11 +3828,11 @@ Type ModuleFile::getType(TypeID TID) {
     if (parent) {
       auto assocTypeDecl = cast<AssociatedTypeDecl>(getDecl(assocTypeOrNameID));
       archetype = ArchetypeType::getNew(ctx, parent, assocTypeDecl,
-                                        conformances, superclass);
+                                        conformances, superclass, layout);
     } else {
       archetype = ArchetypeType::getNew(ctx, genericEnv,
                                         getIdentifier(assocTypeOrNameID),
-                                        conformances, superclass);
+                                        conformances, superclass, layout);
     }
 
     typeOrOffset = archetype;
@@ -4305,7 +4373,9 @@ void ModuleFile::finishNormalConformance(NormalProtocolConformance *conformance,
 
       // Create an archetype builder, which will help us create the
       // synthetic environment.
-      ArchetypeBuilder builder(*getAssociatedModule());
+      ArchetypeBuilder builder(
+                         getContext(),
+                         LookUpConformanceInModule(getAssociatedModule()));
       builder.addGenericSignature(syntheticSig);
       builder.finalize(SourceLoc());
       syntheticEnv = builder.getGenericEnvironment(syntheticSig);
@@ -4321,12 +4391,10 @@ void ModuleFile::finishNormalConformance(NormalProtocolConformance *conformance,
         reqToSyntheticMap.addSubstitution(canonicalGP, concreteTy);
 
         if (unsigned numConformances = *rawIDIter++) {
-          SmallVector<ProtocolConformanceRef, 2> conformances;
           while (numConformances--) {
-            conformances.push_back(readConformance(DeclTypeCursor));
+            reqToSyntheticMap.addConformance(
+                canonicalGP, readConformance(DeclTypeCursor));
           }
-          reqToSyntheticMap.addConformances(canonicalGP,
-                                            ctx.AllocateCopy(conformances));
         }
       }
     }

@@ -29,6 +29,7 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckerDebugConsumer.h"
 #include "llvm/ADT/ilist.h"
@@ -552,7 +553,7 @@ public:
 
   /// \brief Simplify the given type by substituting all occurrences of
   /// type variables for their fixed types.
-  Type simplifyType(TypeChecker &tc, Type type) const;
+  Type simplifyType(Type type) const;
 
   /// \brief Coerce the given expression to the given type.
   ///
@@ -609,17 +610,10 @@ public:
   /// Compute the set of substitutions required to map the given type
   /// to the provided "opened" type.
   ///
-  /// Either the generic type (\c origType) must be a \c GenericFunctionType,
-  /// in which case it's generic requirements will be used to compute the
-  /// required substitutions, or \c dc must be a generic context, in which
-  /// case it's generic requirements will be used.
-  ///
-  /// \param origType The generic type.
+  /// \param sig The generic signature.
   ///
   /// \param openedType The type to which this reference to the given
   /// generic function type was opened.
-  ///
-  /// \param dc The declaration context that owns the generic type
   ///
   /// \param locator The locator that describes where the substitutions came
   /// from.
@@ -628,8 +622,7 @@ public:
   /// to be applied to the generic function type.
   ///
   /// \returns The opened type after applying the computed substitutions.
-  Type computeSubstitutions(Type origType,
-                            DeclContext *dc,
+  Type computeSubstitutions(GenericSignature *sig,
                             Type openedType,
                             ConstraintLocator *locator,
                             SmallVectorImpl<Substitution> &substitutions) const;
@@ -871,10 +864,14 @@ private:
 
   /// \brief Counter for type variables introduced.
   unsigned TypeCounter = 0;
-  
-  /// \brief The expression being solved has exceeded the solver's memory
-  /// threshold.
-  bool expressionExceededThreshold = false;
+
+  /// \brief The number of scopes created so far during the solution
+  /// of this constraint system.
+  ///
+  /// This is a measure of complexity of the solution space. A new
+  /// scope is created every time we attempt a type variable binding
+  /// or explore an option in a disjunction.
+  unsigned CountScopes = 0;
 
   /// \brief Cached member lookups.
   llvm::DenseMap<std::pair<Type, DeclName>, Optional<LookupResult>>
@@ -1041,6 +1038,7 @@ private:
     ///
     /// \param scope The scope to associate with current solver state.
     void registerScope(SolverScope *scope) {
+      CS.incrementScopeCounter();
       scopes.insert({ scope, std::make_pair(retiredConstraints.begin(),
                                             generatedConstraints.size()) });
     }
@@ -1277,6 +1275,10 @@ public:
 private:
   unsigned assignTypeVariableID() {
     return TypeCounter++;
+  }
+
+  void incrementScopeCounter() {
+    CountScopes++;
   }
 
 public:
@@ -2455,21 +2457,36 @@ public:
   Expr *applySolutionShallow(const Solution &solution, Expr *expr,
                              bool suppressDiagnostics);
   
-  /// \brief Set whether or not the expression being solved is too complex and
-  /// has exceeded the solver's memory threshold.
-  void setExpressionTooComplex(bool tc) {
-    expressionExceededThreshold = tc;
-  }
-  
   /// \brief Reorder the disjunctive clauses for a given expression to
   /// increase the likelihood that a favored constraint will be successfully
   /// resolved before any others.
   void optimizeConstraints(Expr *e);
   
-  /// \brief Determine if the expression being solved has exceeded the solver's
-  /// memory threshold.
+  /// \brief Determine if we've already explored too many paths in an
+  /// attempt to solve this expression.
   bool getExpressionTooComplex() {
-    return expressionExceededThreshold;
+    if (!getASTContext().isSwiftVersion3()) {
+      if (CountScopes < TypeCounter)
+        return false;
+
+      // If we haven't explored a relatively large number of possibilities
+      // yet, continue.
+      if (CountScopes <= 16 * 1024)
+        return false;
+
+      // Clearly exponential
+      if (TypeCounter < 32 && CountScopes > (1U << TypeCounter))
+        return true;
+
+      // Bail out once we've looked at a really large number of
+      // choices, even if we haven't used a huge amount of memory.
+      if (CountScopes > TC.Context.LangOpts.SolverBindingThreshold)
+        return true;
+    }
+
+    auto used = TC.Context.getSolverMemory();
+    auto threshold = TC.Context.LangOpts.SolverMemoryThreshold;
+    return used > threshold;
   }
 
   LLVM_ATTRIBUTE_DEPRECATED(

@@ -125,17 +125,6 @@ function(_add_variant_c_compile_link_flags)
       "-B" "${SWIFT_ANDROID_PREBUILT_PATH}/arm-linux-androideabi/bin/")
   endif()
 
-  if("${CFLAGS_SDK}" STREQUAL "WINDOWS")
-    list(APPEND result "-DLLVM_ON_WIN32")
-    list(APPEND result "-D_CRT_SECURE_NO_WARNINGS")
-    list(APPEND result "-D_CRT_NONSTDC_NO_WARNINGS")
-    # TODO(compnerd) permit building for different families
-    list(APPEND result "-D_CRT_USE_WINAPI_FAMILY_DESKTOP_APP")
-    # TODO(compnerd) handle /MT
-    list(APPEND result "-D_DLL")
-    list(APPEND result "-fms-compatibility-version=1900")
-  endif()
-
   if(IS_DARWIN)
     # Check if there's a specific OS deployment version needed for this invocation
     if("${CFLAGS_SDK}" STREQUAL "OSX")
@@ -233,6 +222,17 @@ function(_add_variant_c_compile_flags)
     list(APPEND result -fno-pic)
   endif()
 
+  if("${CFLAGS_SDK}" STREQUAL "WINDOWS")
+    list(APPEND result "-DLLVM_ON_WIN32")
+    list(APPEND result "-D_CRT_SECURE_NO_WARNINGS")
+    list(APPEND result "-D_CRT_NONSTDC_NO_WARNINGS")
+    # TODO(compnerd) permit building for different families
+    list(APPEND result "-D_CRT_USE_WINAPI_FAMILY_DESKTOP_APP")
+    # TODO(compnerd) handle /MT
+    list(APPEND result "-D_DLL")
+    list(APPEND result "-fms-compatibility-version=1900")
+  endif()
+
   if(CFLAGS_ENABLE_ASSERTIONS)
     list(APPEND result "-UNDEBUG")
   else()
@@ -260,8 +260,12 @@ function(_add_variant_swift_compile_flags
     sdk arch build_type enable_assertions result_var_name)
   set(result ${${result_var_name}})
 
+  # On Windows, we don't set SWIFT_SDK_WINDOWS_PATH, so don't include it.
+  if (NOT "${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
+    list(APPEND result "-sdk" "${SWIFT_SDK_${sdk}_PATH}")
+  endif()
+
   list(APPEND result
-      "-sdk" "${SWIFT_SDK_${sdk}_PATH}"
       "-target" "${SWIFT_SDK_${sdk}_ARCH_${arch}_TRIPLE}"
       "-resource-dir" "${SWIFTLIB_DIR}")
 
@@ -717,6 +721,7 @@ function(_add_swift_library_single target name)
       swift_object_dependency_target
       swift_module_dependency_target
       swift_sib_dependency_target
+      swift_sibopt_dependency_target
       swift_sibgen_dependency_target
       SWIFTLIB_SINGLE_SOURCES
       SWIFTLIB_SINGLE_EXTERNAL_SOURCES ${name}
@@ -749,6 +754,11 @@ function(_add_swift_library_single target name)
   if (swift_sib_dependency_target)
     add_dependencies(swift-stdlib${VARIANT_SUFFIX}-sib
       ${swift_sib_dependency_target})
+  endif()
+
+  if (swift_sibopt_dependency_target)
+    add_dependencies(swift-stdlib${VARIANT_SUFFIX}-sibopt
+      ${swift_sibopt_dependency_target})
   endif()
 
   if (swift_sibgen_dependency_target)
@@ -800,7 +810,7 @@ function(_add_swift_library_single target name)
     endif()
   endif()
 
-  if("${SWIFTLIB_SINGLE_SDK}" STREQUAL "WINDOWS")
+  if("${SWIFTLIB_SINGLE_SDK}" STREQUAL "WINDOWS" AND NOT "${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
     if("${libkind}" STREQUAL "SHARED")
       # Each dll has an associated .lib (import library); since we may be
       # building on a non-DLL platform (not windows), create an imported target
@@ -876,7 +886,7 @@ function(_add_swift_library_single target name)
   elseif("${SWIFTLIB_SINGLE_SDK}" STREQUAL "CYGWIN")
     set_target_properties("${target}"
       PROPERTIES
-      INSTALL_RPATH "$ORIGIN:/usr/lib/swift/windows")
+      INSTALL_RPATH "$ORIGIN:/usr/lib/swift/cygwin")
   endif()
 
   set_target_properties("${target}" PROPERTIES BUILD_WITH_INSTALL_RPATH YES)
@@ -949,10 +959,17 @@ function(_add_swift_library_single target name)
   set(prefixed_link_libraries)
   foreach(dep ${SWIFTLIB_SINGLE_LINK_LIBRARIES})
     if("${dep}" MATCHES "^clang")
-      set(dep "${LLVM_LIBRARY_OUTPUT_INTDIR}/lib${dep}.a")
-    endif()
-    if("${dep}" STREQUAL "cmark")
-      set(dep "${CMARK_LIBRARY_DIR}/lib${dep}.a")
+      if("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "WINDOWS")
+        set(dep "${LLVM_LIBRARY_OUTPUT_INTDIR}/${dep}.lib")
+      else()
+        set(dep "${LLVM_LIBRARY_OUTPUT_INTDIR}/lib${dep}.a")
+      endif()
+    elseif("${dep}" STREQUAL "cmark")
+      if("${SWIFT_HOST_VARIANT_SDK}" STREQUAL "WINDOWS")
+        set(dep "${CMARK_LIBRARY_DIR}/${dep}.lib")
+      else()
+        set(dep "${CMARK_LIBRARY_DIR}/lib${dep}.a")
+      endif()
     endif()
     list(APPEND prefixed_link_libraries "${dep}")
   endforeach()
@@ -1124,7 +1141,7 @@ function(_add_swift_library_single target name)
         # libraries are only associated with shared libraries, so add an
         # additional check for that as well.
         set(import_library ${library})
-        if(TARGET ${library})
+        if(TARGET ${library} AND NOT "${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
           get_target_property(type ${library} TYPE)
           if(${type} STREQUAL "SHARED_LIBRARY")
             set(import_library ${library}_IMPLIB)
@@ -1239,6 +1256,9 @@ endfunction()
 # SWIFT_MODULE_DEPENDS_LINUX
 #   Swift modules this library depends on when built for Linux.
 #
+# SWIFT_MODULE_DEPENDS_CYGWIN
+#   Swift modules this library depends on when built for Cygwin.
+#
 # FRAMEWORK_DEPENDS
 #   System frameworks this library depends on.
 #
@@ -1312,7 +1332,7 @@ function(add_swift_library name)
   cmake_parse_arguments(SWIFTLIB
     "${SWIFTLIB_options}"
     "INSTALL_IN_COMPONENT;DEPLOYMENT_VERSION_OSX;DEPLOYMENT_VERSION_IOS;DEPLOYMENT_VERSION_TVOS;DEPLOYMENT_VERSION_WATCHOS"
-    "DEPENDS;LINK_LIBRARIES;SWIFT_MODULE_DEPENDS;SWIFT_MODULE_DEPENDS_OSX;SWIFT_MODULE_DEPENDS_IOS;SWIFT_MODULE_DEPENDS_TVOS;SWIFT_MODULE_DEPENDS_WATCHOS;SWIFT_MODULE_DEPENDS_FREEBSD;SWIFT_MODULE_DEPENDS_LINUX;FRAMEWORK_DEPENDS;FRAMEWORK_DEPENDS_WEAK;FRAMEWORK_DEPENDS_OSX;FRAMEWORK_DEPENDS_IOS_TVOS;LLVM_COMPONENT_DEPENDS;FILE_DEPENDS;TARGET_SDKS;C_COMPILE_FLAGS;SWIFT_COMPILE_FLAGS;SWIFT_COMPILE_FLAGS_OSX;SWIFT_COMPILE_FLAGS_IOS;SWIFT_COMPILE_FLAGS_TVOS;SWIFT_COMPILE_FLAGS_WATCHOS;LINK_FLAGS;PRIVATE_LINK_LIBRARIES;INTERFACE_LINK_LIBRARIES;INCORPORATE_OBJECT_LIBRARIES;INCORPORATE_OBJECT_LIBRARIES_SHARED_ONLY"
+    "DEPENDS;LINK_LIBRARIES;SWIFT_MODULE_DEPENDS;SWIFT_MODULE_DEPENDS_OSX;SWIFT_MODULE_DEPENDS_IOS;SWIFT_MODULE_DEPENDS_TVOS;SWIFT_MODULE_DEPENDS_WATCHOS;SWIFT_MODULE_DEPENDS_FREEBSD;SWIFT_MODULE_DEPENDS_LINUX;SWIFT_MODULE_DEPENDS_CYGWIN;FRAMEWORK_DEPENDS;FRAMEWORK_DEPENDS_WEAK;FRAMEWORK_DEPENDS_OSX;FRAMEWORK_DEPENDS_IOS_TVOS;LLVM_COMPONENT_DEPENDS;FILE_DEPENDS;TARGET_SDKS;C_COMPILE_FLAGS;SWIFT_COMPILE_FLAGS;SWIFT_COMPILE_FLAGS_OSX;SWIFT_COMPILE_FLAGS_IOS;SWIFT_COMPILE_FLAGS_TVOS;SWIFT_COMPILE_FLAGS_WATCHOS;LINK_FLAGS;PRIVATE_LINK_LIBRARIES;INTERFACE_LINK_LIBRARIES;INCORPORATE_OBJECT_LIBRARIES;INCORPORATE_OBJECT_LIBRARIES_SHARED_ONLY"
     ${ARGN})
   set(SWIFTLIB_SOURCES ${SWIFTLIB_UNPARSED_ARGUMENTS})
 
@@ -1445,6 +1465,9 @@ function(add_swift_library name)
         elseif("${sdk}" STREQUAL "LINUX" OR "${sdk}" STREQUAL "ANDROID")
           list(APPEND swiftlib_module_depends_flattened
               ${SWIFTLIB_SWIFT_MODULE_DEPENDS_LINUX})
+        elseif("${sdk}" STREQUAL "CYGWIN")
+          list(APPEND swiftlib_module_depends_flattened
+               ${SWIFTLIB_SWIFT_MODULE_DEPENDS_CYGWIN})
         endif()
 
         # Swift compiles depend on swift modules, while links depend on
@@ -1841,6 +1864,7 @@ function(_add_swift_executable_single name)
       dependency_target
       unused_module_dependency_target
       unused_sib_dependency_target
+      unused_sibopt_dependency_target
       unused_sibgen_dependency_target
       SWIFTEXE_SINGLE_SOURCES SWIFTEXE_SINGLE_EXTERNAL_SOURCES ${name}
       DEPENDS

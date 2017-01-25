@@ -925,11 +925,11 @@ public:
         objcMetaType = CanExistentialMetatypeType::get(type,
                                                   MetatypeRepresentation::ObjC);
       }
-      selfMetaObjC = ManagedValue(
-                       SGF.B.emitThickToObjCMetatype(
-                         loc, selfMeta.getValue(),
-                         SGF.SGM.getLoweredType(objcMetaType)),
-                       selfMeta.getCleanup());
+      // ObjC metatypes are trivial and thus do not have a cleanup. Only if we
+      // convert them to an object do they become non-trivial.
+      assert(!selfMeta.hasCleanup());
+      selfMetaObjC = ManagedValue::forUnmanaged(SGF.B.emitThickToObjCMetatype(
+          loc, selfMeta.getValue(), SGF.SGM.getLoweredType(objcMetaType)));
     }
 
     // Allocate the object.
@@ -1677,8 +1677,8 @@ SILValue SILGenFunction::emitApplyWithRethrow(SILLocation loc,
   // Emit the rethrow logic.
   {
     B.emitBlock(errorBB);
-    SILValue error =
-        errorBB->createPHIArgument(silFnType->getErrorResult().getSILType());
+    SILValue error = errorBB->createPHIArgument(
+        silFnType->getErrorResult().getSILType(), ValueOwnershipKind::Owned);
 
     B.createBuiltin(loc, SGM.getASTContext().getIdentifier("willThrow"),
                     SGM.Types.getEmptyTupleType(), {}, {error});
@@ -1689,7 +1689,7 @@ SILValue SILGenFunction::emitApplyWithRethrow(SILLocation loc,
 
   // Enter the normal path.
   B.emitBlock(normalBB);
-  return normalBB->createPHIArgument(resultType);
+  return normalBB->createPHIArgument(resultType, ValueOwnershipKind::Owned);
 }
 
 static RValue emitStringLiteral(SILGenFunction &SGF, Expr *E, StringRef Str,
@@ -1833,7 +1833,7 @@ static SILValue emitRawApply(SILGenFunction &gen,
   // Otherwise, we need to create a try_apply.
   } else {
     SILBasicBlock *normalBB = gen.createBasicBlock();
-    result = normalBB->createPHIArgument(resultType);
+    result = normalBB->createPHIArgument(resultType, ValueOwnershipKind::Owned);
 
     SILBasicBlock *errorBB =
       gen.getTryApplyErrorDest(loc, substFnType->getErrorResult(),
@@ -2361,11 +2361,6 @@ RValue SILGenFunction::emitApply(
       }
       break;
 
-    // If self is already deallocating, self does not need to be retained or
-    // released since the deallocating bit has been set.
-    case ParameterConvention::Direct_Deallocating:
-      break;
-
     case ParameterConvention::Indirect_In_Guaranteed:
     case ParameterConvention::Indirect_In:
     case ParameterConvention::Indirect_Inout:
@@ -2585,14 +2580,19 @@ static ManagedValue emitMaterializeIntoTemporary(SILGenFunction &gen,
                                                  ManagedValue object) {
   auto temporary = gen.emitTemporaryAllocation(loc, object.getType());
   bool hadCleanup = object.hasCleanup();
-  gen.B.emitStoreValueOperation(loc, object.forward(gen), temporary,
-                                StoreOwnershipQualifier::Init);
 
   // The temporary memory is +0 if the value was.
   if (hadCleanup) {
-    return ManagedValue(temporary, gen.enterDestroyCleanup(temporary));
+    gen.B.emitStoreValueOperation(loc, object.forward(gen), temporary,
+                                  StoreOwnershipQualifier::Init);
+
+    // SEMANTIC SIL TODO: This should really be called a temporary LValue.
+    return ManagedValue::forOwnedAddressRValue(temporary,
+                                               gen.enterDestroyCleanup(temporary));
   } else {
-    return ManagedValue::forUnmanaged(temporary);
+    object = gen.emitManagedBeginBorrow(loc, object.getValue());
+    gen.emitManagedStoreBorrow(loc, object.getValue(), temporary);
+    return ManagedValue::forBorrowedAddressRValue(temporary);
   }
 }
 
@@ -4354,7 +4354,7 @@ namespace {
             // The captures are represented as a placeholder curry level in the
             // formal type.
             // TODO: Remove this hack.
-            paramLowering.claimCaptureParams(callee.getCaptures());
+            (void)paramLowering.claimCaptureParams(callee.getCaptures());
             claimNextParamClause(origFormalType);
             claimNextParamClause(formalType);
             args.push_back({});
@@ -5051,7 +5051,6 @@ ArgumentSource SILGenFunction::prepareAccessorBaseArg(SILLocation loc,
       case ParameterConvention::Direct_Owned:
       case ParameterConvention::Direct_Unowned:
       case ParameterConvention::Direct_Guaranteed:
-      case ParameterConvention::Direct_Deallocating:
         return true;
       }
       llvm_unreachable("bad convention");
@@ -5539,7 +5538,8 @@ RValue SILGenFunction::emitDynamicMemberRefExpr(DynamicMemberRefExpr *e,
     auto dynamicMethodTy = getDynamicMethodLoweredType(*this, operand, member,
                                                        memberFnTy);
     auto loweredMethodTy = SILType::getPrimitiveObjectType(dynamicMethodTy);
-    SILValue memberArg = hasMemberBB->createPHIArgument(loweredMethodTy);
+    SILValue memberArg = hasMemberBB->createPHIArgument(
+        loweredMethodTy, ValueOwnershipKind::Owned);
 
     // Create the result value.
     SILValue result = emitDynamicPartialApply(*this, e, memberArg, operand,
@@ -5634,7 +5634,8 @@ RValue SILGenFunction::emitDynamicSubscriptExpr(DynamicSubscriptExpr *e,
     auto dynamicMethodTy = getDynamicMethodLoweredType(*this, base, member,
                                                        functionTy);
     auto loweredMethodTy = SILType::getPrimitiveObjectType(dynamicMethodTy);
-    SILValue memberArg = hasMemberBB->createPHIArgument(loweredMethodTy);
+    SILValue memberArg = hasMemberBB->createPHIArgument(
+        loweredMethodTy, ValueOwnershipKind::Owned);
     // Emit the application of 'self'.
     SILValue result = emitDynamicPartialApply(*this, e, memberArg, base,
                                               cast<FunctionType>(methodTy));

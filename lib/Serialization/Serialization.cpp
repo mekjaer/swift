@@ -17,8 +17,11 @@
 #include "swift/AST/DiagnosticsCommon.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/AST/Initializer.h"
 #include "swift/AST/LinkLibrary.h"
 #include "swift/AST/Mangle.h"
+#include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/ASTMangler.h"
 #include "swift/AST/RawComment.h"
 #include "swift/AST/USRGeneration.h"
 #include "swift/Basic/Dwarf.h"
@@ -165,8 +168,8 @@ namespace llvm {
   };
 } // namespace llvm
 
-static Module *getModule(ModuleOrSourceFile DC) {
-  if (auto M = DC.dyn_cast<Module *>())
+static ModuleDecl *getModule(ModuleOrSourceFile DC) {
+  if (auto M = DC.dyn_cast<ModuleDecl *>())
     return M;
   return DC.get<SourceFile *>()->getParentModule();
 }
@@ -378,7 +381,7 @@ IdentifierID Serializer::addIdentifierRef(Identifier ident) {
   return id;
 }
 
-IdentifierID Serializer::addModuleRef(const Module *M) {
+IdentifierID Serializer::addModuleRef(const ModuleDecl *M) {
   if (M == this->M)
     return CURRENT_MODULE_ID;
   if (M == this->M->getASTContext().TheBuiltinModule)
@@ -664,10 +667,10 @@ void Serializer::writeDocHeader() {
 }
 
 static void
-removeDuplicateImports(SmallVectorImpl<Module::ImportedModule> &imports) {
+removeDuplicateImports(SmallVectorImpl<ModuleDecl::ImportedModule> &imports) {
   std::sort(imports.begin(), imports.end(),
-            [](const Module::ImportedModule &lhs,
-               const Module::ImportedModule &rhs) -> bool {
+            [](const ModuleDecl::ImportedModule &lhs,
+               const ModuleDecl::ImportedModule &rhs) -> bool {
     // Arbitrarily sort by name to get a deterministic order.
     // FIXME: Submodules don't get sorted properly here.
     if (lhs.second != rhs.second)
@@ -681,17 +684,17 @@ removeDuplicateImports(SmallVectorImpl<Module::ImportedModule> &imports) {
     });
   });
   auto last = std::unique(imports.begin(), imports.end(),
-                          [](const Module::ImportedModule &lhs,
-                             const Module::ImportedModule &rhs) -> bool {
+                          [](const ModuleDecl::ImportedModule &lhs,
+                             const ModuleDecl::ImportedModule &rhs) -> bool {
     if (lhs.second != rhs.second)
       return false;
-    return Module::isSameAccessPath(lhs.first, rhs.first);
+    return ModuleDecl::isSameAccessPath(lhs.first, rhs.first);
   });
   imports.erase(last, imports.end());
 }
 
 using ImportPathBlob = llvm::SmallString<64>;
-static void flattenImportPath(const Module::ImportedModule &import,
+static void flattenImportPath(const ModuleDecl::ImportedModule &import,
                               ImportPathBlob &out) {
   ArrayRef<FileUnit *> files = import.second->getFiles();
   if (auto clangModule = dyn_cast<ClangModuleUnit>(files.front())) {
@@ -740,22 +743,22 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
 
   // FIXME: Having to deal with private imports as a superset of public imports
   // is inefficient.
-  SmallVector<Module::ImportedModule, 8> publicImports;
-  SmallVector<Module::ImportedModule, 8> allImports;
+  SmallVector<ModuleDecl::ImportedModule, 8> publicImports;
+  SmallVector<ModuleDecl::ImportedModule, 8> allImports;
   for (auto file : M->getFiles()) {
-    file->getImportedModules(publicImports, Module::ImportFilter::Public);
-    file->getImportedModules(allImports, Module::ImportFilter::All);
+    file->getImportedModules(publicImports, ModuleDecl::ImportFilter::Public);
+    file->getImportedModules(allImports, ModuleDecl::ImportFilter::All);
   }
 
-  llvm::SmallSet<Module::ImportedModule, 8, Module::OrderImportedModules>
+  llvm::SmallSet<ModuleDecl::ImportedModule, 8, ModuleDecl::OrderImportedModules>
     publicImportSet;
   publicImportSet.insert(publicImports.begin(), publicImports.end());
 
   removeDuplicateImports(allImports);
   auto clangImporter =
     static_cast<ClangImporter *>(M->getASTContext().getClangModuleLoader());
-  Module *importedHeaderModule = clangImporter->getImportedHeaderModule();
-  Module *theBuiltinModule = M->getASTContext().TheBuiltinModule;
+  ModuleDecl *importedHeaderModule = clangImporter->getImportedHeaderModule();
+  ModuleDecl *theBuiltinModule = M->getASTContext().TheBuiltinModule;
   for (auto import : allImports) {
     if (import.second == theBuiltinModule)
       continue;
@@ -967,6 +970,7 @@ static uint8_t getRawStableRequirementKind(RequirementKind kind) {
   CASE(Conformance)
   CASE(Superclass)
   CASE(SameType)
+  CASE(Layout)
   }
 #undef CASE
 
@@ -981,12 +985,26 @@ void Serializer::writeGenericRequirements(ArrayRef<Requirement> requirements,
     return;
 
   auto reqAbbrCode = abbrCodes[GenericRequirementLayout::Code];
+  auto layoutReqAbbrCode = abbrCodes[LayoutRequirementLayout::Code];
   for (const auto &req : requirements) {
-    GenericRequirementLayout::emitRecord(
-      Out, ScratchRecord, reqAbbrCode,
-      getRawStableRequirementKind(req.getKind()),
-      addTypeRef(req.getFirstType()),
-      addTypeRef(req.getSecondType()));
+    if (req.getKind() != RequirementKind::Layout)
+      GenericRequirementLayout::emitRecord(
+          Out, ScratchRecord, reqAbbrCode,
+          getRawStableRequirementKind(req.getKind()),
+          addTypeRef(req.getFirstType()), addTypeRef(req.getSecondType()));
+    else {
+      // Write layout requirement.
+      auto layout = req.getLayoutConstraint();
+      unsigned size = 0;
+      unsigned alignment = 0;
+      if (layout->isKnownSizeTrivial()) {
+        size = layout->getTrivialSizeInBits();
+        alignment = layout->getAlignment();
+      }
+      LayoutRequirementLayout::emitRecord(
+          Out, ScratchRecord, layoutReqAbbrCode, (unsigned)layout->getKind(),
+          addTypeRef(req.getFirstType()), size, alignment);
+    }
   }
 }
 
@@ -1527,7 +1545,7 @@ void Serializer::writeCrossReference(const DeclContext *DC, uint32_t pathLen) {
   case DeclContextKind::Module:
     abbrCode = DeclTypeAbbrCodes[XRefLayout::Code];
     XRefLayout::emitRecord(Out, ScratchRecord, abbrCode,
-                           addModuleRef(cast<Module>(DC)), pathLen);
+                           addModuleRef(cast<ModuleDecl>(DC)), pathLen);
     break;
 
   case DeclContextKind::GenericTypeDecl: {
@@ -1963,11 +1981,12 @@ void Serializer::writeDeclAttribute(const DeclAttribute *DA) {
 
   case DAK_Specialize: {
     auto abbrCode = DeclTypeAbbrCodes[SpecializeDeclAttrLayout::Code];
-    SmallVector<TypeID, 8> typeIDs;
-    for (auto tl : cast<SpecializeAttr>(DA)->getTypeLocs())
-      typeIDs.push_back(addTypeRef(tl.getType()));
+    auto SA = cast<SpecializeAttr>(DA);
 
-    SpecializeDeclAttrLayout::emitRecord(Out, ScratchRecord, abbrCode, typeIDs);
+    SpecializeDeclAttrLayout::emitRecord(Out, ScratchRecord, abbrCode,
+                                         (unsigned)SA->isExported(),
+                                         (unsigned)SA->getSpecializationKind());
+    writeGenericRequirements(SA->getRequirements(), DeclTypeAbbrCodes);
     return;
   }
   }
@@ -2902,7 +2921,6 @@ static uint8_t getRawStableParameterConvention(swift::ParameterConvention pc) {
   SIMPLE_CASE(ParameterConvention, Direct_Owned)
   SIMPLE_CASE(ParameterConvention, Direct_Unowned)
   SIMPLE_CASE(ParameterConvention, Direct_Guaranteed)
-  SIMPLE_CASE(ParameterConvention, Direct_Deallocating)
   }
   llvm_unreachable("bad parameter convention kind");
 }
@@ -2933,7 +2951,7 @@ static TypeAliasDecl *findTypeAliasForBuiltin(ASTContext &Ctx,
   StringRef TypeName = FullName.substr(8);
 
   SmallVector<ValueDecl*, 4> CurModuleResults;
-  Ctx.TheBuiltinModule->lookupValue(Module::AccessPathTy(),
+  Ctx.TheBuiltinModule->lookupValue(ModuleDecl::AccessPathTy(),
                                     Ctx.getIdentifier(TypeName),
                                     NLKind::QualifiedLookup,
                                     CurModuleResults);
@@ -3790,8 +3808,8 @@ class DeclGroupNameContext {
       auto PathOp = VD->getDeclContext()->getParentSourceFile()->getBufferID();
       if (!PathOp.hasValue())
         return NullGroupName;
-      StringRef FullPath = StringRef(VD->getASTContext().SourceMgr.
-                                     getIdentifierForBuffer(PathOp.getValue()));
+      StringRef FullPath =
+        VD->getASTContext().SourceMgr.getIdentifierForBuffer(PathOp.getValue());
       if (!pMap) {
         YamlGroupInputParser Parser(RecordPath);
         if (!Parser.parse()) {
@@ -3854,7 +3872,7 @@ static void writeGroupNames(const comment_block::GroupNamesLayout &GroupNames,
 
 static void writeDeclCommentTable(
     const comment_block::DeclCommentListLayout &DeclCommentList,
-    const SourceFile *SF, const Module *M,
+    const SourceFile *SF, const ModuleDecl *M,
     DeclGroupNameContext &GroupContext) {
 
   struct DeclCommentTableWriter : public ASTWalker {
@@ -4180,10 +4198,8 @@ void Serializer::writeAST(ModuleOrSourceFile DC) {
 
     for (auto TD : localTypeDecls) {
       hasLocalTypes = true;
-
-      Mangle::Mangler DebugMangler(false);
-      DebugMangler.mangleType(TD->getDeclaredInterfaceType(), 0);
-      auto MangledName = DebugMangler.finalize();
+      std::string MangledName = NewMangling::mangleTypeAsUSR(
+                                              TD->getDeclaredInterfaceType());
       assert(!MangledName.empty() && "Mangled type came back empty!");
       localTypeGenerator.insert(MangledName, {
         addDeclRef(TD), TD->getLocalDiscriminator()

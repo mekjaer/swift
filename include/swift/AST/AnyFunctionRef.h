@@ -13,6 +13,7 @@
 #ifndef SWIFT_AST_ANY_FUNCTION_REF_H
 #define SWIFT_AST_ANY_FUNCTION_REF_H
 
+#include "swift/Basic/Compiler.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/Expr.h"
@@ -149,7 +150,12 @@ public:
     }
     llvm_unreachable("unexpected AnyFunctionRef representation");
   }
-  
+
+// Disable "only for use within the debugger" warning.
+#if SWIFT_COMPILER_IS_MSVC
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
   LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
                             "only for use within the debugger") {
     if (auto afd = TheFunction.dyn_cast<AbstractFunctionDecl *>()) {
@@ -171,6 +177,9 @@ public:
     llvm_unreachable("unexpected AnyFunctionRef representation");
   }
 };
+#if SWIFT_COMPILER_IS_MSVC
+#pragma warning(pop)
+#endif
 
 } // namespace swift
 

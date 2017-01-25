@@ -452,7 +452,7 @@ public:
             }
           }
           if (!Handled &&
-              AE->getType()->getCanonicalType() == Context.TheEmptyTupleType) {
+              AE->getType()->isEqual(Context.TheEmptyTupleType)) {
             if (auto *DSCE = dyn_cast<DotSyntaxCallExpr>(AE->getFn())) {
               Expr *TargetExpr = DSCE->getArg();
               Added<Expr *> Target_RE;
@@ -742,8 +742,7 @@ public:
                               /*IsCaptureList*/false, SourceLoc(),
                               Context.getIdentifier(NameBuf),
                               MaybeLoadInitExpr->getType(), TypeCheckDC);
-
-    VD->setInterfaceType(VD->getType());
+    VD->setInterfaceType(TypeCheckDC->mapTypeOutOfContext(VD->getType()));
     VD->setImplicit();
 
     NamedPattern *NP = new (Context) NamedPattern(VD, /*implicit*/ true);

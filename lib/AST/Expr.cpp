@@ -41,6 +41,8 @@ StringRef swift::getFunctionRefKindStr(FunctionRefKind refKind) {
   case FunctionRefKind::Compound:
     return "compound";
   }
+
+  llvm_unreachable("Unhandled FunctionRefKind in switch.");
 }
 
 //===----------------------------------------------------------------------===//
@@ -777,6 +779,8 @@ bool Expr::canAppendCallParentheses() const {
   case ExprKind::EditorPlaceholder:
     return false;
   }
+
+  llvm_unreachable("Unhandled ExprKind in switch.");
 }
 
 llvm::DenseMap<Expr *, Expr *> Expr::getParentMap() {
@@ -1407,6 +1411,8 @@ TupleExpr *TupleExpr::create(ASTContext &ctx,
                              ArrayRef<SourceLoc> ElementNameLocs,
                              SourceLoc RParenLoc, bool HasTrailingClosure, 
                              bool Implicit, Type Ty) {
+  assert(!Ty || isa<TupleType>(Ty.getPointer()));
+
   size_t size =
       totalSizeToAlloc<Expr *, Identifier, SourceLoc>(SubExprs.size(),
                                                       ElementNames.size(),

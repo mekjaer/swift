@@ -21,6 +21,7 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/DebuggerClient.h"
 #include "swift/AST/LazyResolver.h"
+#include "swift/AST/Initializer.h"
 #include "swift/AST/ReferencedNameTracker.h"
 #include "swift/Basic/Fallthrough.h"
 #include "swift/Basic/SourceManager.h"
@@ -52,7 +53,7 @@ static void forAllVisibleModules(const DeclContext *DC, const Fn &fn) {
   if (auto file = dyn_cast<FileUnit>(moduleScope))
     file->forAllVisibleModules(fn);
   else
-    cast<Module>(moduleScope)->forAllVisibleModules(Module::AccessPathTy(), fn);
+    cast<ModuleDecl>(moduleScope)->forAllVisibleModules(ModuleDecl::AccessPathTy(), fn);
 }
 
 bool swift::removeOverriddenDecls(SmallVectorImpl<ValueDecl*> &decls) {
@@ -135,7 +136,7 @@ static ConstructorComparison compareConstructors(ConstructorDecl *ctor1,
 }
 
 bool swift::removeShadowedDecls(SmallVectorImpl<ValueDecl*> &decls,
-                                const Module *curModule,
+                                const ModuleDecl *curModule,
                                 LazyResolver *typeResolver) {
   // Category declarations by their signatures.
   llvm::SmallDenseMap<std::pair<CanType, Identifier>,
@@ -427,6 +428,8 @@ static DeclVisibilityKind getLocalDeclVisibilityKind(const ASTScope *scope) {
   case ASTScopeKind::ForStmtInitializer:
     return DeclVisibilityKind::LocalVariable;
   }
+
+  llvm_unreachable("Unhandled ASTScopeKind in switch.");
 }
 
 UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
@@ -435,7 +438,7 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
                                      SourceLoc Loc, bool IsTypeLookup,
                                      bool AllowProtocolMembers,
                                      bool IgnoreAccessControl) {
-  Module &M = *DC->getParentModule();
+  ModuleDecl &M = *DC->getParentModule();
   ASTContext &Ctx = M.getASTContext();
   const SourceManager &SM = Ctx.SourceMgr;
   DebuggerClient *DebugClient = M.getDebugClient();
@@ -646,13 +649,16 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
         ValueDecl *MetaBaseDecl = nullptr;
         GenericParamList *GenericParams = nullptr;
         Type ExtendedType;
-        
+        bool isTypeLookup = false;
+
         // If this declcontext is an initializer for a static property, then we're
         // implicitly doing a static lookup into the parent declcontext.
         if (auto *PBI = dyn_cast<PatternBindingInitializer>(DC))
           if (!DC->getParent()->isModuleScopeContext()) {
-            if (PBI->getBinding())
+            if (auto *PBD = PBI->getBinding()) {
+              isTypeLookup = PBD->isStatic();
               DC = DC->getParent();
+            }
           }
         
         if (auto *AFD = dyn_cast<AbstractFunctionDecl>(DC)) {
@@ -690,6 +696,10 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
             MetaBaseDecl = AFD->getDeclContext()
                 ->getAsNominalTypeOrNominalTypeExtensionContext();
             DC = DC->getParent();
+
+            if (auto *FD = dyn_cast<FuncDecl>(AFD))
+              if (FD->isStatic())
+                isTypeLookup = true;
 
             // If we're not in the body of the function, the base declaration
             // is the nominal type, not 'self'.
@@ -777,6 +787,23 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
           DC->lookupQualified(ExtendedType, Name, options, TypeResolver, Lookup);
           bool FoundAny = false;
           for (auto Result : Lookup) {
+            // In Swift 3 mode, unqualified lookup skips static methods when
+            // performing lookup from instance context.
+            //
+            // We don't want to carry this forward to Swift 4, since it makes
+            // for poor diagnostics.
+            //
+            // Also, it was quite a special case and not as general as it
+            // should be -- it didn't apply to properties or subscripts, and
+            // the opposite case where we're in static context and an instance
+            // member shadows the module member wasn't handled either.
+            if (Ctx.isSwiftVersion3() &&
+                !isTypeLookup &&
+                isa<FuncDecl>(Result) &&
+                cast<FuncDecl>(Result)->isStatic()) {
+              continue;
+            }
+
             // Classify this declaration.
             FoundAny = true;
 
@@ -865,9 +892,9 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
   recordLookupOfTopLevelName(DC, Name, isCascadingUse.getValue());
 
   // Add private imports to the extra search list.
-  SmallVector<Module::ImportedModule, 8> extraImports;
+  SmallVector<ModuleDecl::ImportedModule, 8> extraImports;
   if (auto FU = dyn_cast<FileUnit>(DC))
-    FU->getImportedModules(extraImports, Module::ImportFilter::Private);
+    FU->getImportedModules(extraImports, ModuleDecl::ImportFilter::Private);
 
   using namespace namelookup;
   SmallVector<ValueDecl *, 8> CurModuleResults;
@@ -908,11 +935,11 @@ UnqualifiedLookup::UnqualifiedLookup(DeclName Name, DeclContext *DC,
     return;
   }
 
-  Module *desiredModule = Ctx.getLoadedModule(Name.getBaseName());
+  ModuleDecl *desiredModule = Ctx.getLoadedModule(Name.getBaseName());
   if (!desiredModule && Name == Ctx.TheBuiltinModule->getName())
     desiredModule = Ctx.TheBuiltinModule;
   if (desiredModule) {
-    forAllVisibleModules(DC, [&](const Module::ImportedModule &import) -> bool {
+    forAllVisibleModules(DC, [&](const ModuleDecl::ImportedModule &import) -> bool {
       if (import.second == desiredModule) {
         Results.push_back(UnqualifiedLookupResult(import.second));
         return false;
@@ -1255,7 +1282,7 @@ static bool checkAccessibility(const DeclContext *useDC,
   case Accessibility::FilePrivate:
     return useDC->getModuleScopeContext() == sourceDC->getModuleScopeContext();
   case Accessibility::Internal: {
-    const Module *sourceModule = sourceDC->getParentModule();
+    const ModuleDecl *sourceModule = sourceDC->getParentModule();
     const DeclContext *useFile = useDC->getModuleScopeContext();
     if (useFile->getParentModule() == sourceModule)
       return true;
@@ -1310,15 +1337,17 @@ bool DeclContext::lookupQualified(Type type,
       return None;
     default:
       // FIXME: Use llvm::CountPopulation_64 when that's declared constexpr.
+#if defined(__clang__) || defined(__GNUC__)
       static_assert(__builtin_popcountll(NL_KnownDependencyMask) == 2,
                     "mask should only include four values");
+#endif
       llvm_unreachable("mask only includes four values");
     }
   };
 
   // Look for module references.
   if (auto moduleTy = type->getAs<ModuleType>()) {
-    Module *module = moduleTy->getModule();
+    ModuleDecl *module = moduleTy->getModule();
     auto topLevelScope = getModuleScopeContext();
     if (module == topLevelScope->getParentModule()) {
       if (auto maybeLookupCascade = checkLookupCascading()) {
@@ -1336,7 +1365,7 @@ bool DeclContext::lookupQualified(Type type,
 
       // Perform the lookup in all imports of this module.
       forAllVisibleModules(this,
-                           [&](const Module::ImportedModule &import) -> bool {
+                           [&](const ModuleDecl::ImportedModule &import) -> bool {
         if (import.second != module)
           return true;
         lookupInModule(import.second, import.first, member, decls,
@@ -1554,7 +1583,7 @@ bool DeclContext::lookupQualified(Type type,
 
     // Collect all of the visible declarations.
     SmallVector<ValueDecl *, 4> allDecls;
-    forAllVisibleModules(this, [&](Module::ImportedModule import) {
+    forAllVisibleModules(this, [&](ModuleDecl::ImportedModule import) {
       import.second->lookupClassMember(import.first, member, allDecls);
     });
 
@@ -1597,7 +1626,7 @@ bool DeclContext::lookupQualified(Type type,
     removeOverriddenDecls(decls);
 
   // If we're supposed to remove shadowed/hidden declarations, do so now.
-  Module *M = getParentModule();
+  ModuleDecl *M = getParentModule();
   if (options & NL_RemoveNonVisible)
     removeShadowedDecls(decls, M, typeResolver);
 
@@ -1612,7 +1641,7 @@ void DeclContext::lookupAllObjCMethods(
        ObjCSelector selector,
        SmallVectorImpl<AbstractFunctionDecl *> &results) const {
   // Collect all of the methods with this selector.
-  forAllVisibleModules(this, [&](Module::ImportedModule import) {
+  forAllVisibleModules(this, [&](ModuleDecl::ImportedModule import) {
     import.second->lookupObjCMethods(selector, results);
   });
 

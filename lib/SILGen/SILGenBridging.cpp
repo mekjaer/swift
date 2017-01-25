@@ -18,6 +18,7 @@
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Basic/Fallthrough.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILUndef.h"
@@ -269,8 +270,7 @@ static void buildFuncToBlockInvokeBody(SILGenFunction &gen,
       case ParameterConvention::Direct_Owned:
         gen.emitManagedRValueWithCleanup(v);
         break;
-        
-      case ParameterConvention::Direct_Deallocating:
+
       case ParameterConvention::Direct_Guaranteed:
       case ParameterConvention::Direct_Unowned:
         break;
@@ -295,12 +295,6 @@ static void buildFuncToBlockInvokeBody(SILGenFunction &gen,
       case ParameterConvention::Direct_Unowned:
         // We need to independently retain the value.
         mv = gen.emitManagedRetain(loc, v);
-        break;
-
-      case ParameterConvention::Direct_Deallocating:
-        // We do not need to retain the value since the value is already being
-        // deallocated.
-        mv = ManagedValue::forUnmanaged(v);
         break;
 
       case ParameterConvention::Indirect_In_Guaranteed:
@@ -464,7 +458,11 @@ static ManagedValue emitNativeToCBridgedNonoptionalValue(SILGenFunction &gen,
     if (bridgedMetaTy->getRepresentation() == MetatypeRepresentation::ObjC) {
       SILValue native = gen.B.emitThickToObjCMetatype(loc, v.getValue(),
                            SILType::getPrimitiveObjectType(loweredBridgedTy));
-      return ManagedValue(native, v.getCleanup());
+      // *NOTE*: ObjCMetatypes are trivial types. They only gain ARC semantics
+      // when they are converted to an object via objc_metatype_to_object.
+      assert(!v.hasCleanup() &&
+             "Metatypes are trivial and thus should not have cleanups");
+      return ManagedValue::forUnmanaged(native);
     }
   }
 
@@ -717,7 +715,11 @@ static ManagedValue emitCBridgedToNativeValue(SILGenFunction &gen,
     if (bridgedMetaTy->getRepresentation() == MetatypeRepresentation::ObjC) {
       SILValue native = gen.B.emitObjCToThickMetatype(loc, v.getValue(),
                                         gen.getLoweredType(loweredNativeTy));
-      return ManagedValue(native, v.getCleanup());
+      // *NOTE*: ObjCMetatypes are trivial types. They only gain ARC semantics
+      // when they are converted to an object via objc_metatype_to_object.
+      assert(!v.hasCleanup() && "Metatypes are trivial and should not have "
+                                "cleanups");
+      return ManagedValue::forUnmanaged(native);
     }
   }
 
@@ -935,14 +937,6 @@ static SILFunctionType *emitObjCThunkArguments(SILGenFunction &gen,
       continue;
     }
 
-    // If this parameter is deallocating, emit an unmanaged rvalue and
-    // continue. The object has the deallocating bit set so retain, release is
-    // irrelevant.
-    if (inputs[i].isDeallocating()) {
-      bridgedArgs.push_back(ManagedValue::forUnmanaged(arg));
-      continue;
-    }
-
     // If the argument is a block, copy it.
     if (argTy.isBlockPointerCompatible()) {
       auto copy = gen.B.createCopyBlock(loc, arg);
@@ -1072,7 +1066,8 @@ void SILGenFunction::emitNativeToForeignThunk(SILDeclRef thunk) {
     // Emit the non-error destination.
     {
       B.emitBlock(normalBB);
-      SILValue nativeResult = normalBB->createPHIArgument(swiftResultTy);
+      SILValue nativeResult =
+          normalBB->createPHIArgument(swiftResultTy, ValueOwnershipKind::Owned);
 
       if (substTy->hasIndirectResults()) {
         assert(substTy->getNumAllResults() == 1);
@@ -1093,8 +1088,8 @@ void SILGenFunction::emitNativeToForeignThunk(SILDeclRef thunk) {
     // Emit the error destination.
     {
       B.emitBlock(errorBB);
-      SILValue nativeError =
-          errorBB->createPHIArgument(substTy->getErrorResult().getSILType());
+      SILValue nativeError = errorBB->createPHIArgument(
+          substTy->getErrorResult().getSILType(), ValueOwnershipKind::Owned);
 
       // In this branch, the eventual return value is mostly invented.
       // Store the native error in the appropriate location and return.
@@ -1106,7 +1101,7 @@ void SILGenFunction::emitNativeToForeignThunk(SILDeclRef thunk) {
 
     // Emit the join block.
     B.emitBlock(contBB);
-    result = contBB->createPHIArgument(objcResultTy);
+    result = contBB->createPHIArgument(objcResultTy, ValueOwnershipKind::Owned);
 
     // Leave the scope now.
     argScope.pop();
@@ -1259,9 +1254,6 @@ void SILGenFunction::emitForeignToNativeThunk(SILDeclRef thunk) {
         case ParameterConvention::Direct_Guaranteed:
         case ParameterConvention::Direct_Unowned:
           param = emitManagedRetain(fd, paramValue);
-          break;
-        case ParameterConvention::Direct_Deallocating:
-          param = ManagedValue::forUnmanaged(paramValue);
           break;
         case ParameterConvention::Indirect_Inout:
         case ParameterConvention::Indirect_InoutAliasable:

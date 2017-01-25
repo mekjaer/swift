@@ -43,10 +43,18 @@ public typealias CShort = Int16
 public typealias CInt = Int32
 
 /// The C 'long' type.
+#if os(Windows) && !CYGWIN && arch(x86_64)
+public typealias CLong = Int32
+#else
 public typealias CLong = Int
+#endif
 
 /// The C 'long long' type.
+#if os(Windows) && !CYGWIN && arch(x86_64)
+public typealias CLongLong = Int
+#else
 public typealias CLongLong = Int64
+#endif
 
 /// The C 'float' type.
 public typealias CFloat = Float
@@ -78,6 +86,7 @@ public typealias CBool = Bool
 /// cannot be represented in Swift, such as incomplete struct types.
 @_fixed_layout
 public struct OpaquePointer : Hashable {
+  @_versioned
   internal var _rawValue: Builtin.RawPointer
 
   @_versioned

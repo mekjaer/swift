@@ -25,6 +25,7 @@
 #include "swift/AST/TypeAlignments.h"
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/Availability.h"
+#include "swift/Basic/Compiler.h"
 #include "llvm/Support/TrailingObjects.h"
 
 namespace llvm {
@@ -62,10 +63,12 @@ enum class ExprKind : uint8_t {
 #include "swift/AST/ExprNodes.def"
 };
   
-/// Discriminates the different kinds of checked cast supported.
+/// Discriminates certain kinds of checked cast that have specialized diagnostic
+/// and/or code generation peephole behavior.
 ///
-/// This enumeration should not exist. Only the collection downcast kinds are
-/// currently significant. Please don't add new kinds.
+/// This enumeration should not have any semantic effect on the behavior of a
+/// well-typed program, since the runtime can perform all casts that are
+/// statically accepted.
 enum class CheckedCastKind : unsigned {
   /// The kind has not been determined yet.
   Unresolved,
@@ -75,7 +78,7 @@ enum class CheckedCastKind : unsigned {
 
   /// The requested cast is an implicit conversion, so this is a coercion.
   Coercion = First_Resolved,
-  /// A non-value-changing checked cast.
+  /// A checked cast with no known specific behavior.
   ValueCast,
   // A downcast from an array type to another array type.
   ArrayDowncast,
@@ -83,10 +86,17 @@ enum class CheckedCastKind : unsigned {
   DictionaryDowncast,
   // A downcast from a set type to another set type.
   SetDowncast,
-  /// A bridging cast.
-  BridgingCast,
+  /// A bridging conversion that always succeeds.
+  BridgingCoercion,
+  /// A bridging conversion that may fail, because there are multiple Swift
+  /// value types that bridge to the same Cocoa object type.
+  ///
+  /// This kind is only used for Swift 3 compatibility diagnostics and is
+  /// treated the same as 'BridgingCoercion' otherwise. In Swift 4 or later,
+  /// any conversions with this kind show up as ValueCasts.
+  Swift3BridgingDowncast,
 
-  Last_CheckedCastKind = BridgingCast,
+  Last_CheckedCastKind = Swift3BridgingDowncast,
 };
 
 enum class AccessSemantics : unsigned char {
@@ -663,15 +673,14 @@ class TrailingCallArguments
   }
 
   size_t numTrailingObjects(
-      typename TrailingObjects::template OverloadToken<Identifier>) const {
+      SWIFT_TRAILING_OBJECTS_OVERLOAD_TOKEN(Identifier)) const {
     return asDerived().getNumArguments();
   }
 
   size_t numTrailingObjects(
-      typename TrailingObjects::template OverloadToken<SourceLoc>) const {
-    return asDerived().hasArgumentLabelLocs()
-             ? asDerived().getNumArguments()
-             : 0;
+      SWIFT_TRAILING_OBJECTS_OVERLOAD_TOKEN(SourceLoc)) const {
+    return asDerived().hasArgumentLabelLocs() ? asDerived().getNumArguments()
+                                              : 0;
   }
 
   /// Retrieve the buffer containing the argument labels.
@@ -4447,6 +4456,8 @@ public:
     case ObjCSelectorKind::Setter:
       return true;
     }
+
+    llvm_unreachable("Unhandled ObjcSelectorKind in switch.");
   }
 
   /// Whether this selector references a method.

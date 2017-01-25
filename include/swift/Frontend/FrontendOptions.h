@@ -149,6 +149,8 @@ public:
     /// Parse, type-check, and dump type refinement context hierarchy
     DumpTypeRefinementContexts,
 
+    EmitPCH, ///< Emit PCH of imported bridging header
+
     EmitSILGen, ///< Emit raw SIL
     EmitSIL, ///< Emit canonical SIL
 
@@ -178,6 +180,9 @@ public:
 
   /// If set, dumps wall time taken to check each function body to llvm::errs().
   bool DebugTimeFunctionBodies = false;
+
+  /// If set, dumps wall time taken to check each expression.
+  bool DebugTimeExpressionTypeChecking = false;
 
   /// If set, prints the time taken in each major compilation phase to 
   /// llvm::errs().

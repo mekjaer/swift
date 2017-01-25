@@ -1784,6 +1784,42 @@ namespace {
                               C.getIdentifier("Value")).front());
 
       auto locator = CS.getConstraintLocator(expr);
+      auto contextualType = CS.getContextualType(expr);
+      Type contextualDictionaryType = nullptr;
+      Type contextualDictionaryKeyType = nullptr;
+      Type contextualDictionaryValueType = nullptr;
+      
+      // If a contextual type exists for this expression, apply it directly.
+      Optional<std::pair<Type, Type>> dictionaryKeyValue;
+      if (contextualType &&
+          (dictionaryKeyValue = ConstraintSystem::isDictionaryType(contextualType))) {
+        // Is the contextual type a dictionary type?
+        contextualDictionaryType = contextualType;
+        std::tie(contextualDictionaryKeyType,
+                 contextualDictionaryValueType) = *dictionaryKeyValue;
+        
+        // Form an explicit tuple type from the contextual type's key and value types.
+        TupleTypeElt tupleElts[2] = { TupleTypeElt(contextualDictionaryKeyType),
+                                      TupleTypeElt(contextualDictionaryValueType) };
+        Type contextualDictionaryElementType = TupleType::get(tupleElts, C);
+        
+        CS.addConstraint(ConstraintKind::LiteralConformsTo, contextualType,
+                         dictionaryProto->getDeclaredType(),
+                         locator);
+        
+        unsigned index = 0;
+        for (auto element : expr->getElements()) {
+          CS.addConstraint(ConstraintKind::Conversion,
+                           element->getType(),
+                           contextualDictionaryElementType,
+                           CS.getConstraintLocator(expr,
+                                                   LocatorPathElt::
+                                                    getTupleElement(index++)));
+        }
+        
+        return contextualDictionaryType;
+      }
+      
       auto dictionaryTy = CS.createTypeVariable(locator,
                                                 TVO_PrefersSubtypeBinding);
 
@@ -2753,6 +2789,32 @@ namespace {
   public:
     SanitizeExpr(TypeChecker &tc) : TC(tc) { }
 
+    std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
+      // Let's check if condition of the IfExpr looks properly
+      // type-checked, and roll it back to the original state,
+      // because otherwise, since condition is implicitly Int1,
+      // we'll have to handle multiple ways of type-checking
+      // IfExprs in both ConstraintGenerator and ExprRewriter,
+      // so it's less error prone to do it once here.
+      if (auto IE = dyn_cast<IfExpr>(expr)) {
+        auto condition = IE->getCondExpr();
+        if (!condition)
+          return {true, expr};
+
+        if (auto call = dyn_cast<CallExpr>(condition)) {
+          if (!call->isImplicit())
+            return {true, expr};
+
+          if (auto DSCE = dyn_cast<DotSyntaxCallExpr>(call->getFn())) {
+            if (DSCE->isImplicit())
+              IE->setCondExpr(DSCE->getBase());
+          }
+        }
+      }
+
+      return {true, expr};
+    }
+
     Expr *walkToExprPost(Expr *expr) override {
       if (auto implicit = dyn_cast<ImplicitConversionExpr>(expr)) {
         // Skip implicit conversions completely.
@@ -2855,9 +2917,7 @@ namespace {
 
           // If the function type has an error in it, we don't want to solve the
           // system.
-          if (closureTy &&
-              (closureTy->hasError() ||
-               closureTy->getCanonicalType()->hasError()))
+          if (closureTy && closureTy->hasError())
             return nullptr;
 
           CS.setType(closure, closureTy);
@@ -3166,6 +3226,9 @@ bool swift::isExtensionApplied(DeclContext &DC, Type BaseTy,
     switch(Req.getKind()) {
       case RequirementKind::Conformance:
         createMemberConstraint(Req, ConstraintKind::ConformsTo);
+        break;
+      case RequirementKind::Layout:
+        createMemberConstraint(Req, ConstraintKind::Layout);
         break;
       case RequirementKind::Superclass:
         createMemberConstraint(Req, ConstraintKind::Subtype);

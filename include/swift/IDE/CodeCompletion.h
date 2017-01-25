@@ -18,7 +18,6 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Allocator.h"
-#include "llvm/Support/TimeValue.h"
 #include "llvm/Support/TrailingObjects.h"
 #include <functional>
 #include <memory>
@@ -63,7 +62,7 @@ class CodeCompletionStringChunk {
 
 public:
   enum class ChunkKind {
-    /// "public", "internal", "fileprivate", or "private".
+    /// "open", "public", "internal", "fileprivate", or "private".
     AccessControlKeyword,
 
     /// such as @"availability".

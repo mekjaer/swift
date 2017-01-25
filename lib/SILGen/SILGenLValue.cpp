@@ -958,7 +958,8 @@ namespace {
         auto rawPointerTy = SILType::getRawPointerType(ctx);
 
         // The callback is a BB argument from the switch_enum.
-        SILValue callback = writebackBB->createPHIArgument(rawPointerTy);
+        SILValue callback = writebackBB->createPHIArgument(
+            rawPointerTy, ValueOwnershipKind::Trivial);
 
         // Cast the callback to the correct polymorphic function type.
         auto origCallbackFnType = gen.SGM.Types.getMaterializeForSetCallbackType(
@@ -1669,9 +1670,8 @@ LValue SILGenLValue::visitDiscardAssignmentExpr(DiscardAssignmentExpr *e,
   SILValue address = gen.emitTemporaryAllocation(e, typeData.TypeOfRValue);
   address = gen.B.createMarkUninitialized(e, address,
                                           MarkUninitializedInst::Var);
-  gen.enterDestroyCleanup(address);
   LValue lv;
-  lv.add<ValueComponent>(ManagedValue::forUnmanaged(address), typeData);
+  lv.add<ValueComponent>(gen.emitManagedBufferWithCleanup(address), typeData);
   return lv;
 }
 

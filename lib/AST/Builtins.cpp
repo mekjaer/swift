@@ -145,7 +145,7 @@ getBuiltinFunction(Identifier Id, ArrayRef<Type> argTypes, Type ResType,
   Type ArgType = TupleType::get(tupleElts, Context);
   Type FnType = FunctionType::get(ArgType, ResType, Info);
 
-  Module *M = Context.TheBuiltinModule;
+  ModuleDecl *M = Context.TheBuiltinModule;
   DeclContext *DC = &M->getMainFile(FileUnitKind::Builtin);
 
   SmallVector<ParamDecl*, 4> params;
@@ -202,7 +202,7 @@ getBuiltinGenericFunction(Identifier Id,
   Type InterfaceType = GenericFunctionType::get(Sig, ArgParamType, ResType,
                                                 AnyFunctionType::ExtInfo());
 
-  Module *M = Context.TheBuiltinModule;
+  ModuleDecl *M = Context.TheBuiltinModule;
   DeclContext *DC = &M->getMainFile(FileUnitKind::Builtin);
 
   SmallVector<ParamDecl*, 4> params;
@@ -425,7 +425,7 @@ static const char * const GenericParamNames[] = {
 
 static GenericTypeParamDecl*
 createGenericParam(ASTContext &ctx, const char *name, unsigned index) {
-  Module *M = ctx.TheBuiltinModule;
+  ModuleDecl *M = ctx.TheBuiltinModule;
   Identifier ident = ctx.getIdentifier(name);
   SmallVector<ProtocolDecl *, 1> protos;
   auto genericParam =
@@ -472,7 +472,8 @@ namespace {
       TheGenericParamList = getGenericParams(ctx, numGenericParams,
                                              GenericTypeParams);
 
-      ArchetypeBuilder Builder(*ctx.TheBuiltinModule);
+      ArchetypeBuilder Builder(ctx,
+                               LookUpConformanceInModule(ctx.TheBuiltinModule));
       for (auto gp : GenericTypeParams)
         Builder.addGenericParameter(gp);
 
@@ -1137,7 +1138,7 @@ static const char *const IntrinsicNameTable[] = {
 /// getLLVMIntrinsicID - Given an LLVM IR intrinsic name with argument types
 /// removed (e.g. like "bswap") return the LLVM IR IntrinsicID for the intrinsic
 /// or 0 if the intrinsic name doesn't match anything.
-unsigned swift::getLLVMIntrinsicID(StringRef InName, bool hasArgTypes) {
+unsigned swift::getLLVMIntrinsicID(StringRef InName) {
   using namespace llvm;
 
   // Swift intrinsic names start with int_.
@@ -1150,9 +1151,7 @@ unsigned swift::getLLVMIntrinsicID(StringRef InName, bool hasArgTypes) {
   NameS.append("llvm.");
   for (char C : InName)
     NameS.push_back(C == '_' ? '.' : C);
-  if (hasArgTypes)
-    NameS.push_back('.');
-  
+
   const char *Name = NameS.c_str();
   ArrayRef<const char *> NameTable(&IntrinsicNameTable[1],
                                    TargetInfos[1].Offset);
@@ -1316,6 +1315,8 @@ static bool isUnknownOrUnordered(llvm::AtomicOrdering ordering) {
   case AtomicOrdering::SequentiallyConsistent:
     return false;
   }
+
+  llvm_unreachable("Unhandled AtomicOrdering in switch.");
 }
 
 static bool isValidCmpXChgOrdering(StringRef SuccessString, 
@@ -1345,7 +1346,7 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
 
   // If this is the name of an LLVM intrinsic, cons up a swift function with a
   // type that matches the IR types.
-  if (unsigned ID = getLLVMIntrinsicID(OperationName, !Types.empty())) {
+  if (unsigned ID = getLLVMIntrinsicID(OperationName)) {
     SmallVector<Type, 8> ArgElts;
     Type ResultTy;
     FunctionType::ExtInfo Info;

@@ -14,6 +14,7 @@
 #include "swift/SILOptimizer/Analysis/ClassHierarchyAnalysis.h"
 #include "swift/SILOptimizer/Utils/Devirtualize.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILFunction.h"
@@ -231,8 +232,12 @@ SILValue swift::getInstanceWithExactDynamicType(SILValue S, SILModule &M,
 
   while (S) {
     S = stripCasts(S);
-    if (isa<AllocRefInst>(S) || isa<MetatypeInst>(S))
+
+    if (isa<AllocRefInst>(S) || isa<MetatypeInst>(S)) {
+      if (S->getType().getSwiftRValueType()->hasDynamicSelfType())
+        return SILValue();
       return S;
+    }
 
     auto *Arg = dyn_cast<SILArgument>(S);
     if (!Arg)
@@ -467,7 +472,9 @@ getSubstitutionsForCallee(SILModule &M,
         subMap.addSubstitution(cast<SubstitutableType>(canTy),
                                sub.getReplacement());
       }
-      subMap.addConformances(canTy, sub.getConformances());
+
+      for (auto conformance : sub.getConformances())
+        subMap.addConformance(canTy, conformance);
     }
     assert(origSubs.empty());
   }
@@ -559,6 +566,11 @@ bool swift::canDevirtualizeClassMethod(FullApplySite AI,
     // hidden symbol.
     if (!F->hasValidLinkageForFragileRef())
       return false;
+  }
+
+  if (MI->isVolatile()) {
+    // dynamic dispatch is semantically required, can't devirtualize
+    return false;
   }
 
   // Type of the actual function to be called.
@@ -670,7 +682,7 @@ DevirtualizationResult swift::devirtualizeClassMethod(FullApplySite AI,
       ResultBB = TAI->getNormalBB();
     else {
       ResultBB = B.getFunction().createBasicBlock();
-      ResultBB->createPHIArgument(ResultTy);
+      ResultBB->createPHIArgument(ResultTy, ValueOwnershipKind::Owned);
     }
 
     NormalBB = TAI->getNormalBB();
@@ -680,7 +692,8 @@ DevirtualizationResult swift::devirtualizeClassMethod(FullApplySite AI,
       ErrorBB = TAI->getErrorBB();
     else {
       ErrorBB = B.getFunction().createBasicBlock();
-      ErrorBB->createPHIArgument(TAI->getErrorBB()->getArgument(0)->getType());
+      ErrorBB->createPHIArgument(TAI->getErrorBB()->getArgument(0)->getType(),
+                                 ValueOwnershipKind::Owned);
     }
 
     NewAI = B.createTryApply(AI.getLoc(), FRI, SubstCalleeSILType,
@@ -705,7 +718,7 @@ DevirtualizationResult swift::devirtualizeClassMethod(FullApplySite AI,
       }
       NormalBB->getArgument(0)->replaceAllUsesWith(
           SILUndef::get(AI.getType(), Mod));
-      NormalBB->replacePHIArgument(0, ResultTy);
+      NormalBB->replacePHIArgument(0, ResultTy, ValueOwnershipKind::Owned);
     }
 
     // The result value is passed as a parameter to the normal block.
@@ -839,7 +852,8 @@ static void getWitnessMethodSubstitutions(
     auto gp = cast<GenericTypeParamType>(witnessThunkSig->getGenericParams()
                                                  .front()->getCanonicalType());
     subMap.addSubstitution(gp, origSubs.front().getReplacement());
-    subMap.addConformances(gp, origSubs.front().getConformances());
+    for (auto conformance : origSubs.front().getConformances())
+      subMap.addConformance(gp, conformance);
 
     // For default witnesses, innermost generic parameters are always at
     // depth 1.
@@ -906,7 +920,8 @@ static void getWitnessMethodSubstitutions(
         subMap.addSubstitution(cast<SubstitutableType>(canTy),
                                sub.getReplacement());
       }
-      subMap.addConformances(canTy, sub.getConformances());
+      for (auto conformance : sub.getConformances())
+        subMap.addConformance(canTy, conformance);
     }
     assert(subs.empty() && "Did not consume all substitutions");
   }

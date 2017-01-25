@@ -20,20 +20,21 @@
 #include "swift/Runtime/Metadata.h"
 #include "swift/Runtime/Debug.h"
 #include <stdlib.h>
+#include <random>
 
 namespace swift {
 // FIXME(ABI)#76 : does this declaration need SWIFT_RUNTIME_STDLIB_INTERFACE?
 // _direct type metadata for Swift._EmptyArrayStorage
 SWIFT_RUNTIME_STDLIB_INTERFACE
-extern "C" ClassMetadata CLASS_METADATA_SYM(s18_EmptyArrayStorage);
+ClassMetadata CLASS_METADATA_SYM(s18_EmptyArrayStorage);
 
 // _direct type metadata for Swift._RawNativeDictionaryStorage
 SWIFT_RUNTIME_STDLIB_INTERFACE
-extern "C" ClassMetadata CLASS_METADATA_SYM(s27_RawNativeDictionaryStorage);
+ClassMetadata CLASS_METADATA_SYM(s27_RawNativeDictionaryStorage);
 
 // _direct type metadata for Swift._RawNativeSetStorage
 SWIFT_RUNTIME_STDLIB_INTERFACE
-extern "C" ClassMetadata CLASS_METADATA_SYM(s20_RawNativeSetStorage);
+ClassMetadata CLASS_METADATA_SYM(s20_RawNativeSetStorage);
 } // namespace swift
 
 swift::_SwiftEmptyArrayStorage swift::_swiftEmptyArrayStorage = {
@@ -106,23 +107,10 @@ swift::_SwiftEmptySetStorage swift::_swiftEmptySetStorage = {
 };
 
 static __swift_uint64_t randomUInt64() {
-#if defined(__APPLE__)
-  return static_cast<__swift_uint64_t>(arc4random()) |
-         (static_cast<__swift_uint64_t>(arc4random()) << 32);
-#else
-  auto devUrandom = fopen("/dev/urandom", "r");
-  if (!devUrandom) {
-    swift::fatalError(/* flags = */ 0, "Opening \"/dev/urandom\" failed");
-  }
-  uint64_t result;
-  if (fread(&result, sizeof(result), 1, devUrandom) != 1) {
-    swift::fatalError(/* flags = */ 0, "Reading from \"/dev/urandom\" failed");
-  }
-  if (fclose(devUrandom)) {
-    swift::fatalError(/* flags = */ 0, "Closing \"/dev/urandom\" failed");
-  }
-  return result;
-#endif
+  std::random_device randomDevice;
+  std::mt19937_64 twisterEngine(randomDevice());
+  std::uniform_int_distribution<__swift_uint64_t> distribution;
+  return distribution(twisterEngine);
 }
 
 SWIFT_ALLOWED_RUNTIME_GLOBAL_CTOR_BEGIN

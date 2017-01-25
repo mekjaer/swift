@@ -35,6 +35,7 @@
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Config.h"
+#include "swift/Strings.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Mangle.h"
 #include "clang/Basic/CharInfo.h"
@@ -82,7 +83,7 @@ namespace {
     void handleImport(const clang::Module *imported) {
       if (!imported)
         return;
-      Module *nativeImported = Impl.finishLoadingClangModule(Importer, imported,
+      ModuleDecl *nativeImported = Impl.finishLoadingClangModule(Importer, imported,
         /*preferAdapter=*/true);
       Impl.ImportedHeaderExports.push_back({ /*filter=*/{}, nativeImported });
     }
@@ -123,9 +124,25 @@ namespace {
     }
   };
 
+  class PCHDeserializationCallbacks : public clang::ASTDeserializationListener {
+    ClangImporter::Implementation &Impl;
+  public:
+    explicit PCHDeserializationCallbacks(ClangImporter::Implementation &impl)
+      : Impl(impl) {}
+    void ModuleImportRead(clang::serialization::SubmoduleID ID,
+                          clang::SourceLocation ImportLoc) {
+      if (Impl.IsReadingBridgingPCH) {
+        Impl.PCHImportedSubmodules.push_back(ID);
+      }
+    }
+  };
+
   class HeaderParsingASTConsumer : public clang::ASTConsumer {
     SmallVector<clang::DeclGroupRef, 4> DeclGroups;
+    PCHDeserializationCallbacks PCHCallbacks;
   public:
+    explicit HeaderParsingASTConsumer(ClangImporter::Implementation &impl)
+      : PCHCallbacks(impl) {}
     void
     HandleTopLevelDeclInObjCContainer(clang::DeclGroupRef decls) override {
       DeclGroups.push_back(decls);
@@ -135,15 +152,40 @@ namespace {
       return DeclGroups;
     }
 
+    clang::ASTDeserializationListener *GetASTDeserializationListener() override {
+      return &PCHCallbacks;
+    }
+
     void reset() {
       DeclGroups.clear();
     }
   };
 
   class ParsingAction : public clang::ASTFrontendAction {
+    ASTContext &Ctx;
+    ClangImporter &Importer;
+    ClangImporter::Implementation &Impl;
+  public:
+    explicit ParsingAction(ASTContext &ctx,
+                           ClangImporter &importer,
+                           ClangImporter::Implementation &impl)
+      : Ctx(ctx), Importer(importer), Impl(impl) {}
     std::unique_ptr<clang::ASTConsumer>
     CreateASTConsumer(clang::CompilerInstance &CI, StringRef InFile) override {
-      return llvm::make_unique<HeaderParsingASTConsumer>();
+      return llvm::make_unique<HeaderParsingASTConsumer>(Impl);
+    }
+    bool BeginSourceFileAction(CompilerInstance &CI,
+                               StringRef Filename) override {
+      // Prefer frameworks over plain headers.
+      // We add search paths here instead of when building the initial invocation
+      // so that (a) we use the same code as search paths for imported modules,
+      // and (b) search paths are always added after -Xcc options.
+      SearchPathOptions &searchPathOpts = Ctx.SearchPathOpts;
+      for (auto path : searchPathOpts.FrameworkSearchPaths)
+        Importer.addSearchPath(path, /*isFramework*/true);
+      for (auto path : searchPathOpts.ImportSearchPaths)
+        Importer.addSearchPath(path, /*isFramework*/false);
+      return true;
     }
   };
 
@@ -157,8 +199,8 @@ namespace {
            /*null-terminated=*/true);
     }
 
-    const char *getBufferIdentifier() const override {
-      return name.c_str();
+    StringRef getBufferIdentifier() const override {
+      return name;
     }
 
     BufferKind getBufferKind() const override {
@@ -317,6 +359,14 @@ getNormalInvocationArguments(std::vector<std::string> &invocationArgStrs,
   SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
 
   auto languageVersion = ctx.LangOpts.EffectiveLanguageVersion;
+
+  if (llvm::sys::path::extension(importerOpts.BridgingHeader).endswith(
+        PCH_EXTENSION)) {
+    invocationArgStrs.insert(
+      invocationArgStrs.end(),
+        { "-include-pch", importerOpts.BridgingHeader }
+    );
+  }
 
   // Construct the invocation arguments for the current target.
   // Add target-independent options first.
@@ -622,6 +672,11 @@ ClangImporter::create(ASTContext &ctx,
   for (auto &argStr : invocationArgStrs)
     invocationArgs.push_back(argStr.c_str());
 
+  if (llvm::sys::path::extension(importerOpts.BridgingHeader).endswith(
+        PCH_EXTENSION)) {
+    importer->Impl.IsReadingBridgingPCH = true;
+  }
+
   // FIXME: These can't be controlled from the command line.
   llvm::IntrusiveRefCntPtr<clang::DiagnosticOptions> diagnosticOpts{
     new clang::DiagnosticOptions
@@ -635,12 +690,10 @@ ClangImporter::create(ASTContext &ctx,
                                                         diagClient.release());
 
   // Create a new Clang compiler invocation.
-  llvm::IntrusiveRefCntPtr<CompilerInvocation> invocation{
-    clang::createInvocationFromCommandLine(invocationArgs, clangDiags)
-  };
-  if (!invocation)
+  importer->Impl.Invocation =
+      clang::createInvocationFromCommandLine(invocationArgs, clangDiags);
+  if (!importer->Impl.Invocation)
     return nullptr;
-  importer->Impl.Invocation = invocation;
 
   // Don't stop emitting messages if we ever can't load a module.
   // FIXME: This is actually a general problem: any "fatal" error could mess up
@@ -656,16 +709,18 @@ ClangImporter::create(ASTContext &ctx,
   auto sourceBuffer = llvm::MemoryBuffer::getMemBuffer(
     "extern int __swift __attribute__((unavailable));",
     Implementation::moduleImportBufferName);
-  clang::PreprocessorOptions &ppOpts = invocation->getPreprocessorOpts();
+  clang::PreprocessorOptions &ppOpts =
+      importer->Impl.Invocation->getPreprocessorOpts();
   ppOpts.addRemappedFile(Implementation::moduleImportBufferName,
                          sourceBuffer.release());
 
   // Install a Clang module file extension to build Swift name lookup tables.
-  invocation->getFrontendOpts().ModuleFileExtensions.push_back(
-      new SwiftNameLookupExtension(importer->Impl.LookupTables,
-                                   importer->Impl.SwiftContext,
-                                   importer->Impl.platformAvailability,
-                                   importer->Impl.InferImportAsMember));
+  importer->Impl.Invocation->getFrontendOpts().ModuleFileExtensions.push_back(
+      std::make_shared<SwiftNameLookupExtension>(
+          importer->Impl.BridgingHeaderLookupTable,
+          importer->Impl.LookupTables, importer->Impl.SwiftContext,
+          importer->Impl.platformAvailability,
+          importer->Impl.InferImportAsMember));
 
   // Create a compiler instance.
   auto PCHContainerOperations =
@@ -677,10 +732,11 @@ ClangImporter::create(ASTContext &ctx,
   importer->Impl.Instance.reset(new CompilerInstance(PCHContainerOperations));
   auto &instance = *importer->Impl.Instance;
   instance.setDiagnostics(&*clangDiags);
-  instance.setInvocation(&*invocation);
+  instance.setInvocation(importer->Impl.Invocation);
 
   // Create the associated action.
-  importer->Impl.Action.reset(new ParsingAction);
+  importer->Impl.Action.reset(new ParsingAction(ctx, *importer,
+                                                importer->Impl));
   auto *action = importer->Impl.Action.get();
 
   // Execute the action. We effectively inline most of
@@ -735,16 +791,6 @@ ClangImporter::create(ASTContext &ctx,
       importer->Impl.SwiftContext, importer->Impl.platformAvailability,
       importer->Impl.getClangSema(), importer->Impl.InferImportAsMember));
 
-  // Prefer frameworks over plain headers.
-  // We add search paths here instead of when building the initial invocation
-  // so that (a) we use the same code as search paths for imported modules,
-  // and (b) search paths are always added after -Xcc options.
-  SearchPathOptions &searchPathOpts = ctx.SearchPathOpts;
-  for (auto path : searchPathOpts.FrameworkSearchPaths)
-    importer->addSearchPath(path, /*isFramework*/true);
-  for (auto path : searchPathOpts.ImportSearchPaths)
-    importer->addSearchPath(path, /*isFramework*/false);
-
   // FIXME: These decls are not being parsed correctly since (a) some of the
   // callbacks are still being added, and (b) the logic to parse them has
   // changed.
@@ -754,7 +800,7 @@ ClangImporter::create(ASTContext &ctx,
       importer->Impl.addBridgeHeaderTopLevelDecls(D);
 
       if (auto named = dyn_cast<clang::NamedDecl>(D)) {
-        addEntryToLookupTable(importer->Impl.BridgingHeaderLookupTable, named,
+        addEntryToLookupTable(*importer->Impl.BridgingHeaderLookupTable, named,
                               *importer->Impl.nameImporter);
       }
     }
@@ -786,10 +832,12 @@ ClangImporter::create(ASTContext &ctx,
     = clangContext.Selectors.getSelector(2, setObjectForKeyedSubscriptIdents);
 
   // Set up the imported header module.
-  auto *importedHeaderModule = Module::create(ctx.getIdentifier("__ObjC"), ctx);
+  auto *importedHeaderModule = ModuleDecl::create(ctx.getIdentifier("__ObjC"), ctx);
   importer->Impl.ImportedHeaderUnit =
     new (ctx) ClangModuleUnit(*importedHeaderModule, *importer, nullptr);
   importedHeaderModule->addFile(*importer->Impl.ImportedHeaderUnit);
+
+  importer->Impl.IsReadingBridgingPCH = false;
 
   return importer;
 }
@@ -814,9 +862,10 @@ bool ClangImporter::addSearchPath(StringRef newSearchPath, bool isFramework) {
 }
 
 bool ClangImporter::Implementation::importHeader(
-    Module *adapter, StringRef headerName, SourceLoc diagLoc,
+    ModuleDecl *adapter, StringRef headerName, SourceLoc diagLoc,
     bool trackParsedSymbols,
-    std::unique_ptr<llvm::MemoryBuffer> sourceBuffer) {
+    std::unique_ptr<llvm::MemoryBuffer> sourceBuffer,
+    bool implicitImport) {
   // Don't even try to load the bridging header if the Clang AST is in a bad
   // state. It could cause a crash.
   auto &clangDiags = getClangASTContext().getDiagnostics();
@@ -868,19 +917,40 @@ bool ClangImporter::Implementation::importHeader(
     consumer.reset();
   }
 
+  // We're trying to discourage (and eventually deprecate) the use of implicit
+  // bridging-header imports triggered by IMPORTED_HEADER blocks in
+  // modules. There are two sub-cases to consider:
+  //
+  //   #1 The implicit import actually occurred.
+  //
+  //   #2 The user explicitly -import-objc-header'ed some header or PCH that
+  //      makes the implicit import redundant.
+  //
+  // It's not obvious how to exactly differentiate these cases given the
+  // interface clang gives us, but we only want to warn on case #1, and the
+  // non-emptiness of allParsedDecls is a _definite_ sign that we're in case
+  // #1. So we treat that as an approximation of the condition we're after, and
+  // accept that we might fail to warn in the odd case where "the import
+  // occurred" but didn't introduce any new decls.
+  if (implicitImport && !allParsedDecls.empty()) {
+    SwiftContext.Diags.diagnose(
+      diagLoc, diag::implicit_bridging_header_imported_from_module,
+      llvm::sys::path::filename(headerName), adapter->getName());
+  }
+
   // We can't do this as we're parsing because we may want to resolve naming
   // conflicts between the things we've parsed.
   for (auto group : allParsedDecls)
     for (auto *D : group)
       if (auto named = dyn_cast<clang::NamedDecl>(D))
-        addEntryToLookupTable(BridgingHeaderLookupTable, named,
+        addEntryToLookupTable(*BridgingHeaderLookupTable, named,
                               getNameImporter());
 
   pp.EndSourceFile();
   bumpGeneration();
 
   // Add any defined macros to the bridging header lookup table.
-  addMacrosToLookupTable(BridgingHeaderLookupTable, getNameImporter());
+  addMacrosToLookupTable(*BridgingHeaderLookupTable, getNameImporter());
 
   // Wrap all Clang imports under a Swift import decl.
   for (auto &Import : BridgeHeaderTopLevelImports) {
@@ -890,7 +960,7 @@ bool ClangImporter::Implementation::importHeader(
   }
 
   // Finalize the lookup table, which may fail.
-  finalizeLookupTable(BridgingHeaderLookupTable, getNameImporter());
+  finalizeLookupTable(*BridgingHeaderLookupTable, getNameImporter());
 
   // FIXME: What do we do if there was already an error?
   if (!hadError && clangDiags.hasErrorOccurred()) {
@@ -902,7 +972,7 @@ bool ClangImporter::Implementation::importHeader(
   return false;
 }
 
-bool ClangImporter::importHeader(StringRef header, Module *adapter,
+bool ClangImporter::importHeader(StringRef header, ModuleDecl *adapter,
                                  off_t expectedSize, time_t expectedModTime,
                                  StringRef cachedContents, SourceLoc diagLoc) {
   clang::FileManager &fileManager = Impl.Instance->getFileManager();
@@ -910,7 +980,7 @@ bool ClangImporter::importHeader(StringRef header, Module *adapter,
                                                            /*OpenFile=*/true);
   if (headerFile && headerFile->getSize() == expectedSize &&
       headerFile->getModificationTime() == expectedModTime) {
-    return importBridgingHeader(header, adapter, diagLoc);
+    return importBridgingHeader(header, adapter, diagLoc, false, true);
   }
 
   if (!cachedContents.empty() && cachedContents.back() == '\0')
@@ -919,12 +989,26 @@ bool ClangImporter::importHeader(StringRef header, Module *adapter,
     llvm::MemoryBuffer::getMemBuffer(cachedContents, header)
   };
   return Impl.importHeader(adapter, header, diagLoc, /*trackParsedSymbols=*/false,
-                           std::move(sourceBuffer));
+                           std::move(sourceBuffer), true);
 }
 
-bool ClangImporter::importBridgingHeader(StringRef header, Module *adapter,
+bool ClangImporter::importBridgingHeader(StringRef header, ModuleDecl *adapter,
                                          SourceLoc diagLoc,
-                                         bool trackParsedSymbols) {
+                                         bool trackParsedSymbols,
+                                         bool implicitImport) {
+  if (llvm::sys::path::extension(header).endswith(PCH_EXTENSION)) {
+    // We already imported this with -include-pch above, so we should have
+    // collected a bunch of PCH-encoded module imports that we need to
+    // replay to the HeaderImportCallbacks for processing.
+    Impl.ImportedHeaderOwners.push_back(adapter);
+    clang::ASTReader &R = *Impl.Instance->getModuleManager();
+    HeaderImportCallbacks CB(*this, Impl);
+    for (auto ID : Impl.PCHImportedSubmodules) {
+      CB.handleImport(R.getSubmodule(ID));
+    }
+    Impl.PCHImportedSubmodules.clear();
+    return false;
+  }
   clang::FileManager &fileManager = Impl.Instance->getFileManager();
   const clang::FileEntry *headerFile = fileManager.getFile(header,
                                                            /*OpenFile=*/true);
@@ -944,15 +1028,15 @@ bool ClangImporter::importBridgingHeader(StringRef header, Module *adapter,
   };
 
   return Impl.importHeader(adapter, header, diagLoc, trackParsedSymbols,
-                           std::move(sourceBuffer));
+                           std::move(sourceBuffer), implicitImport);
 }
 
 std::string ClangImporter::getBridgingHeaderContents(StringRef headerPath,
                                                      off_t &fileSize,
                                                      time_t &fileModTime) {
-  llvm::IntrusiveRefCntPtr<clang::CompilerInvocation> invocation{
-    new clang::CompilerInvocation(*Impl.Invocation)
-  };
+  auto invocation =
+      std::make_shared<clang::CompilerInvocation>(*Impl.Invocation);
+
   invocation->getFrontendOpts().DisableFree = false;
   invocation->getFrontendOpts().Inputs.clear();
   invocation->getFrontendOpts().Inputs.push_back(
@@ -962,7 +1046,7 @@ std::string ClangImporter::getBridgingHeaderContents(StringRef headerPath,
 
   clang::CompilerInstance rewriteInstance(
     Impl.Instance->getPCHContainerOperations());
-  rewriteInstance.setInvocation(&*invocation);
+  rewriteInstance.setInvocation(invocation);
   rewriteInstance.createDiagnostics(new clang::IgnoringDiagConsumer);
 
   clang::FileManager &fileManager = Impl.Instance->getFileManager();
@@ -992,6 +1076,40 @@ std::string ClangImporter::getBridgingHeaderContents(StringRef headerPath,
   fileSize = fileInfo->getSize();
   fileModTime = fileInfo->getModificationTime();
   return result;
+}
+
+bool
+ClangImporter::emitBridgingPCH(StringRef headerPath,
+                               StringRef outputPCHPath) {
+  auto invocation = std::make_shared<clang::CompilerInvocation>
+    (clang::CompilerInvocation(*Impl.Invocation));
+  invocation->getFrontendOpts().DisableFree = false;
+  invocation->getFrontendOpts().Inputs.clear();
+  invocation->getFrontendOpts().Inputs.push_back(
+      clang::FrontendInputFile(headerPath, clang::IK_ObjC));
+  invocation->getFrontendOpts().OutputFile = outputPCHPath;
+  invocation->getPreprocessorOpts().resetNonModularOptions();
+
+  clang::CompilerInstance emitInstance(
+    Impl.Instance->getPCHContainerOperations());
+  emitInstance.setInvocation(std::move(invocation));
+  emitInstance.createDiagnostics(&Impl.Instance->getDiagnosticClient(),
+                                 false);
+
+  clang::FileManager &fileManager = Impl.Instance->getFileManager();
+  emitInstance.setFileManager(&fileManager);
+  emitInstance.createSourceManager(fileManager);
+  emitInstance.setTarget(&Impl.Instance->getTarget());
+
+  clang::GeneratePCHAction action;
+  emitInstance.ExecuteAction(action);
+  if (emitInstance.getDiagnostics().hasErrorOccurred()) {
+    Impl.SwiftContext.Diags.diagnose({},
+                                     diag::bridging_header_pch_error,
+                                     outputPCHPath, headerPath);
+    return true;
+  }
+  return false;
 }
 
 void ClangImporter::collectSubModuleNames(
@@ -1039,7 +1157,7 @@ bool ClangImporter::canImportModule(std::pair<Identifier, SourceLoc> moduleID) {
   return clangModule->isAvailable(ctx.getLangOpts(), getTargetInfo(), r, mh, m);
 }
 
-Module *ClangImporter::loadModule(
+ModuleDecl *ClangImporter::loadModule(
     SourceLoc importLoc,
     ArrayRef<std::pair<Identifier, SourceLoc>> path) {
   auto &clangContext = Impl.getClangASTContext();
@@ -1109,7 +1227,7 @@ Module *ClangImporter::loadModule(
                                        /*preferAdapter=*/false);
 }
 
-Module *ClangImporter::Implementation::finishLoadingClangModule(
+ModuleDecl *ClangImporter::Implementation::finishLoadingClangModule(
     ClangImporter &owner,
     const clang::Module *clangModule,
     bool findAdapter) {
@@ -1119,7 +1237,7 @@ Module *ClangImporter::Implementation::finishLoadingClangModule(
   bumpGeneration();
 
   auto &cacheEntry = ModuleWrappers[clangModule];
-  Module *result;
+  ModuleDecl *result;
   ClangModuleUnit *wrapperUnit;
   if ((wrapperUnit = cacheEntry.getPointer())) {
     result = wrapperUnit->getParentModule();
@@ -1128,14 +1246,14 @@ Module *ClangImporter::Implementation::finishLoadingClangModule(
       // FIXME: This forces the creation of wrapper modules for all imports as
       // well, and may do unnecessary work.
       cacheEntry.setInt(true);
-      result->forAllVisibleModules({}, [&](Module::ImportedModule import) {});
+      result->forAllVisibleModules({}, [&](ModuleDecl::ImportedModule import) {});
     }
   } else {
     // Build the representation of the Clang module in Swift.
     // FIXME: The name of this module could end up as a key in the ASTContext,
     // but that's not correct for submodules.
     Identifier name = SwiftContext.getIdentifier((*clangModule).Name);
-    result = Module::create(name, SwiftContext);
+    result = ModuleDecl::create(name, SwiftContext);
     // Silence error messages about testably importing a Clang module.
     result->setTestingEnabled();
 
@@ -1147,25 +1265,25 @@ Module *ClangImporter::Implementation::finishLoadingClangModule(
     // Force load adapter modules for all imported modules.
     // FIXME: This forces the creation of wrapper modules for all imports as
     // well, and may do unnecessary work.
-    result->forAllVisibleModules({}, [](Module::ImportedModule import) {});
+    result->forAllVisibleModules({}, [](ModuleDecl::ImportedModule import) {});
   }
 
   if (clangModule->isSubModule()) {
     finishLoadingClangModule(owner, clangModule->getTopLevelModule(), true);
   } else {
-    Module *&loaded = SwiftContext.LoadedModules[result->getName()];
+    ModuleDecl *&loaded = SwiftContext.LoadedModules[result->getName()];
     if (!loaded)
       loaded = result;
   }
 
   if (findAdapter)
-    if (Module *adapter = wrapperUnit->getAdapterModule())
+    if (ModuleDecl *adapter = wrapperUnit->getAdapterModule())
       result = adapter;
 
   return result;
 }
 
-Module *ClangImporter::getImportedHeaderModule() const {
+ModuleDecl *ClangImporter::getImportedHeaderModule() const {
   return Impl.ImportedHeaderUnit->getParentModule();
 }
 
@@ -1237,8 +1355,10 @@ ClangImporter::Implementation::Implementation(ASTContext &ctx,
       ImportForwardDeclarations(opts.ImportForwardDeclarations),
       InferImportAsMember(opts.InferImportAsMember),
       DisableSwiftBridgeAttr(opts.DisableSwiftBridgeAttr),
+      IsReadingBridgingPCH(false),
       CurrentVersion(nameVersionFromOptions(ctx.LangOpts)),
-      BridgingHeaderLookupTable(nullptr), platformAvailability(ctx.LangOpts),
+      BridgingHeaderLookupTable(new SwiftLookupTable(nullptr)),
+      platformAvailability(ctx.LangOpts),
       nameImporter() {}
 
 ClangImporter::Implementation::~Implementation() {
@@ -1257,7 +1377,7 @@ ClangModuleUnit *ClangImporter::Implementation::getWrapperForModule(
 
   // FIXME: Handle hierarchical names better.
   Identifier name = SwiftContext.getIdentifier(underlying->Name);
-  auto wrapper = Module::create(name, SwiftContext);
+  auto wrapper = ModuleDecl::create(name, SwiftContext);
   // Silence error messages about testably importing a Clang module.
   wrapper->setTestingEnabled();
 
@@ -1322,22 +1442,6 @@ ClangImporter::Implementation::exportName(Identifier name) {
 
   return ident;
 }
-
-namespace llvm {
-  // An Identifier is "pointer like".
-  template<typename T> class PointerLikeTypeTraits;
-  template<>
-  class PointerLikeTypeTraits<swift::DeclName> {
-  public:
-    static inline void *getAsVoidPointer(swift::DeclName name) {
-      return name.getOpaqueValue();
-    }
-    static inline swift::DeclName getFromVoidPointer(void *ptr) {
-      return swift::DeclName::getFromOpaqueValue(ptr);
-    }
-    enum { NumLowBitsAvailable = 0 };
-  };
-} // namespace llvm
 
 Identifier
 ClangImporter::Implementation::importIdentifier(
@@ -1852,7 +1956,7 @@ void ClangImporter::lookupValue(DeclName name, VisibleDeclConsumer &consumer){
     });
 }
 
-void ClangModuleUnit::lookupVisibleDecls(Module::AccessPathTy accessPath,
+void ClangModuleUnit::lookupVisibleDecls(ModuleDecl::AccessPathTy accessPath,
                                          VisibleDeclConsumer &consumer,
                                          NLKind lookupKind) const {
   // FIXME: Ignore submodules, which are empty for now.
@@ -1986,10 +2090,10 @@ void ClangModuleUnit::getDisplayDecls(SmallVectorImpl<Decl*> &results) const {
   getTopLevelDecls(results);
 }
 
-void ClangModuleUnit::lookupValue(Module::AccessPathTy accessPath,
+void ClangModuleUnit::lookupValue(ModuleDecl::AccessPathTy accessPath,
                                   DeclName name, NLKind lookupKind,
                                   SmallVectorImpl<ValueDecl*> &results) const {
-  if (!Module::matchesAccessPath(accessPath, name))
+  if (!ModuleDecl::matchesAccessPath(accessPath, name))
     return;
 
   // FIXME: Ignore submodules, which are empty for now.
@@ -2139,7 +2243,7 @@ void ClangImporter::loadObjCMethods(
 }
 
 void
-ClangModuleUnit::lookupClassMember(Module::AccessPathTy accessPath,
+ClangModuleUnit::lookupClassMember(ModuleDecl::AccessPathTy accessPath,
                                    DeclName name,
                                    SmallVectorImpl<ValueDecl*> &results) const {
   // FIXME: Ignore submodules, which are empty for now.
@@ -2155,7 +2259,7 @@ ClangModuleUnit::lookupClassMember(Module::AccessPathTy accessPath,
   }
 }
 
-void ClangModuleUnit::lookupClassMembers(Module::AccessPathTy accessPath,
+void ClangModuleUnit::lookupClassMembers(ModuleDecl::AccessPathTy accessPath,
                                          VisibleDeclConsumer &consumer) const {
   // FIXME: Ignore submodules, which are empty for now.
   if (clangModule && clangModule->isSubModule())
@@ -2227,7 +2331,7 @@ void ClangModuleUnit::lookupObjCMethods(
 }
 
 void ClangModuleUnit::collectLinkLibraries(
-    Module::LinkLibraryCallback callback) const {
+    ModuleDecl::LinkLibraryCallback callback) const {
   if (!clangModule)
     return;
   for (auto clangLinkLib : clangModule->LinkLibraries) {
@@ -2245,7 +2349,7 @@ StringRef ClangModuleUnit::getFilename() const {
   if (!clangModule)
     return "<imports>";
   if (const clang::FileEntry *F = clangModule->getASTFile())
-    if (F->getName())
+    if (!F->getName().empty())
       return F->getName();
   return StringRef();
 }
@@ -2313,13 +2417,13 @@ void ClangImporter::verifyAllModules() {
 // ClangModule Implementation
 //===----------------------------------------------------------------------===//
 
-ClangModuleUnit::ClangModuleUnit(Module &M, ClangImporter &owner,
+ClangModuleUnit::ClangModuleUnit(ModuleDecl &M, ClangImporter &owner,
                                  const clang::Module *clangModule)
   : LoadedFile(FileUnitKind::ClangModule, M), owner(owner),
     clangModule(clangModule) {
 }
 
-bool ClangModuleUnit::hasClangModule(Module *M) {
+bool ClangModuleUnit::hasClangModule(ModuleDecl *M) {
   for (auto F : M->getFiles()) {
     if (isa<ClangModuleUnit>(F))
       return true;
@@ -2339,7 +2443,7 @@ clang::ASTContext &ClangModuleUnit::getClangASTContext() const {
   return owner.getClangASTContext();
 }
 
-Module *ClangModuleUnit::getAdapterModule() const {
+ModuleDecl *ClangModuleUnit::getAdapterModule() const {
   if (!clangModule)
     return nullptr;
 
@@ -2352,9 +2456,9 @@ Module *ClangModuleUnit::getAdapterModule() const {
 
   if (!adapterModule.getInt()) {
     // FIXME: Include proper source location.
-    Module *M = getParentModule();
+    ModuleDecl *M = getParentModule();
     ASTContext &Ctx = M->getASTContext();
-    auto adapter = Ctx.getModule(Module::AccessPathTy({M->getName(),
+    auto adapter = Ctx.getModule(ModuleDecl::AccessPathTy({M->getName(),
                                                        SourceLoc()}));
     if (adapter == M) {
       adapter = nullptr;
@@ -2373,15 +2477,15 @@ Module *ClangModuleUnit::getAdapterModule() const {
 }
 
 void ClangModuleUnit::getImportedModules(
-    SmallVectorImpl<Module::ImportedModule> &imports,
-    Module::ImportFilter filter) const {
-  if (filter != Module::ImportFilter::Public)
-    imports.push_back({Module::AccessPathTy(),
+    SmallVectorImpl<ModuleDecl::ImportedModule> &imports,
+    ModuleDecl::ImportFilter filter) const {
+  if (filter != ModuleDecl::ImportFilter::Public)
+    imports.push_back({ModuleDecl::AccessPathTy(),
                        getASTContext().getStdlibModule()});
 
   if (!clangModule) {
     // This is the special "imported headers" module.
-    if (filter != Module::ImportFilter::Private) {
+    if (filter != ModuleDecl::ImportFilter::Private) {
       imports.append(owner.Impl.ImportedHeaderExports.begin(),
                      owner.Impl.ImportedHeaderExports.end());
     }
@@ -2392,8 +2496,8 @@ void ClangModuleUnit::getImportedModules(
 
   SmallVector<clang::Module *, 8> imported;
   clangModule->getExportedModules(imported);
-  if (filter != Module::ImportFilter::Public) {
-    if (filter == Module::ImportFilter::All) {
+  if (filter != ModuleDecl::ImportFilter::Public) {
+    if (filter == ModuleDecl::ImportFilter::All) {
       llvm::SmallPtrSet<clang::Module *, 8> knownModules;
       imported.append(clangModule->Imports.begin(), clangModule->Imports.end());
       imported.erase(std::remove_if(imported.begin(), imported.end(),
@@ -2430,7 +2534,7 @@ void ClangModuleUnit::getImportedModules(
           importTopLevel != clangModule->getTopLevelModule()) {
         auto topLevelWrapper = owner.Impl.getWrapperForModule(owner,
                                                               importTopLevel);
-        imports.push_back({ Module::AccessPathTy(),
+        imports.push_back({ ModuleDecl::AccessPathTy(),
                             topLevelWrapper->getParentModule() });
       }
       actualMod = wrapper->getParentModule();
@@ -2439,12 +2543,12 @@ void ClangModuleUnit::getImportedModules(
     }
 
     assert(actualMod && "Missing imported adapter module");
-    imports.push_back({Module::AccessPathTy(), actualMod});
+    imports.push_back({ModuleDecl::AccessPathTy(), actualMod});
   }
 }
 
 void ClangModuleUnit::getImportedModulesForLookup(
-    SmallVectorImpl<Module::ImportedModule> &imports) const {
+    SmallVectorImpl<ModuleDecl::ImportedModule> &imports) const {
 
   if (!clangModule) {
     // This is the special "imported headers" module.
@@ -2511,7 +2615,7 @@ void ClangModuleUnit::getImportedModulesForLookup(
       actualMod = wrapper->getParentModule();
 
     assert(actualMod && "Missing imported adapter module");
-    imports.push_back({Module::AccessPathTy(), actualMod});
+    imports.push_back({ModuleDecl::AccessPathTy(), actualMod});
   }
 
   // Cache our results for use next time.
@@ -2535,7 +2639,7 @@ SwiftLookupTable *ClangImporter::Implementation::findLookupTable(
                     const clang::Module *clangModule) {
   // If the Clang module is null, use the bridging header lookup table.
   if (!clangModule)
-    return &BridgingHeaderLookupTable;
+    return BridgingHeaderLookupTable.get();
 
   // Submodules share lookup tables with their parents.
   if (clangModule->isSubModule())
@@ -2551,7 +2655,7 @@ SwiftLookupTable *ClangImporter::Implementation::findLookupTable(
 bool ClangImporter::Implementation::forEachLookupTable(
        llvm::function_ref<bool(SwiftLookupTable &table)> fn) {
   // Visit the bridging header's lookup table.
-  if (fn(BridgingHeaderLookupTable)) return true;
+  if (fn(*BridgingHeaderLookupTable)) return true;
 
   // Collect and sort the set of module names.
   SmallVector<StringRef, 4> moduleNames;
@@ -2769,5 +2873,5 @@ void ClangImporter::Implementation::dumpSwiftLookupTables() {
   }
 
   llvm::errs() << "<<Bridging header lookup table>>\n";
-  BridgingHeaderLookupTable.dump();
+  BridgingHeaderLookupTable->dump();
 }

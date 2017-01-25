@@ -49,7 +49,7 @@ public:
                                                CanStructType type);
 };
 
-static CanType getNamedSwiftType(Module *stdlib, StringRef name) {
+static CanType getNamedSwiftType(ModuleDecl *stdlib, StringRef name) {
   auto &ctx = stdlib->getASTContext();
   SmallVector<ValueDecl*, 1> results;
   stdlib->lookupValue({}, ctx.getIdentifier(name), NLKind::QualifiedLookup,
@@ -554,7 +554,6 @@ clang::CanQualType GenClangType::visitSILFunctionType(CanSILFunctionType type) {
     switch (paramTy.getConvention()) {
     case ParameterConvention::Direct_Guaranteed:
     case ParameterConvention::Direct_Unowned:
-    case ParameterConvention::Direct_Deallocating:
       // OK.
       break;
 

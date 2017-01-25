@@ -22,9 +22,11 @@
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/Identifier.h"
+#include "swift/AST/Initializer.h"
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Timer.h"
 #include "swift/ClangImporter/ClangImporter.h"
@@ -221,7 +223,7 @@ Type TypeChecker::getObjectLiteralParameterType(ObjectLiteralExpr *expr,
   llvm_unreachable("unknown literal constructor");
 }
 
-Module *TypeChecker::getStdlibModule(const DeclContext *dc) {
+ModuleDecl *TypeChecker::getStdlibModule(const DeclContext *dc) {
   if (StdlibModule)
     return StdlibModule;
 
@@ -407,6 +409,87 @@ void TypeChecker::bindExtension(ExtensionDecl *ext) {
   ::bindExtensionDecl(ext, *this);
 }
 
+static bool shouldValidateDeclForLayout(NominalTypeDecl *nominal, ValueDecl *VD) {
+  // For enums, we only need to validate enum elements to know
+  // the layout.
+  if (isa<EnumDecl>(nominal) &&
+      isa<EnumElementDecl>(VD))
+    return true;
+
+  // For structs, we only need to validate stored properties to
+  // know the layout.
+  if (isa<StructDecl>(nominal) &&
+      (isa<VarDecl>(VD) &&
+       !cast<VarDecl>(VD)->isStatic() &&
+       (cast<VarDecl>(VD)->hasStorage() ||
+        VD->getAttrs().hasAttribute<LazyAttr>())))
+    return true;
+
+  // For classes, we need to validate properties and functions,
+  // but skipping nested types is OK.
+  if (isa<ClassDecl>(nominal) &&
+      !isa<TypeDecl>(VD))
+    return true;
+
+  // For protocols, skip nested typealiases and nominal types.
+  if (isa<ProtocolDecl>(nominal) &&
+      !isa<GenericTypeDecl>(VD))
+    return true;
+
+  return false;
+}
+
+static void validateDeclForLayout(TypeChecker &TC, NominalTypeDecl *nominal) {
+  Optional<bool> lazyVarsAlreadyHaveImplementation;
+
+  for (auto *D : nominal->getMembers()) {
+    auto VD = dyn_cast<ValueDecl>(D);
+    if (!VD)
+      continue;
+
+    if (!shouldValidateDeclForLayout(nominal, VD))
+      continue;
+
+    TC.validateDecl(VD);
+
+    // The only thing left to do is synthesize storage for lazy variables.
+    // We only have to do that if it's a type from another file, though.
+    // In NDEBUG builds, bail out as soon as we can.
+#ifdef NDEBUG
+    if (lazyVarsAlreadyHaveImplementation.hasValue() &&
+        lazyVarsAlreadyHaveImplementation.getValue())
+      continue;
+#endif
+    auto *prop = dyn_cast<VarDecl>(D);
+    if (!prop)
+      continue;
+
+    if (prop->getAttrs().hasAttribute<LazyAttr>() && !prop->isStatic()
+                                                  && prop->getGetter()) {
+      bool hasImplementation = prop->getGetter()->hasBody();
+
+      if (lazyVarsAlreadyHaveImplementation.hasValue()) {
+        assert(lazyVarsAlreadyHaveImplementation.getValue() ==
+                 hasImplementation &&
+               "only some lazy vars already have implementations");
+      } else {
+        lazyVarsAlreadyHaveImplementation = hasImplementation;
+      }
+
+      if (!hasImplementation)
+        TC.completeLazyVarImplementation(prop);
+    }
+  }
+
+  // FIXME: We need to add implicit initializers and dtors when a decl is
+  // touched, because it affects vtable layout.  If you're not defining the
+  // class, you shouldn't have to know what the vtable layout is.
+  if (auto *CD = dyn_cast<ClassDecl>(nominal)) {
+    TC.addImplicitConstructors(CD);
+    TC.addImplicitDestructor(CD);
+  }
+}
+
 static void typeCheckFunctionsAndExternalDecls(TypeChecker &TC) {
   unsigned currentFunctionIdx = 0;
   unsigned currentExternalDef = TC.Context.LastCheckedExternalDefinition;
@@ -462,50 +545,7 @@ static void typeCheckFunctionsAndExternalDecls(TypeChecker &TC) {
       if (nominal->isInvalid() || TC.Context.hadError())
         continue;
 
-      Optional<bool> lazyVarsAlreadyHaveImplementation;
-
-      for (auto *D : nominal->getMembers()) {
-        auto VD = dyn_cast<ValueDecl>(D);
-        if (!VD)
-          continue;
-        TC.validateDecl(VD);
-
-        // The only thing left to do is synthesize storage for lazy variables.
-        // We only have to do that if it's a type from another file, though.
-        // In NDEBUG builds, bail out as soon as we can.
-#ifdef NDEBUG
-        if (lazyVarsAlreadyHaveImplementation.hasValue() &&
-            lazyVarsAlreadyHaveImplementation.getValue())
-          continue;
-#endif
-        auto *prop = dyn_cast<VarDecl>(D);
-        if (!prop)
-          continue;
-
-        if (prop->getAttrs().hasAttribute<LazyAttr>() && !prop->isStatic()
-                                                      && prop->getGetter()) {
-          bool hasImplementation = prop->getGetter()->hasBody();
-
-          if (lazyVarsAlreadyHaveImplementation.hasValue()) {
-            assert(lazyVarsAlreadyHaveImplementation.getValue() ==
-                     hasImplementation &&
-                   "only some lazy vars already have implementations");
-          } else {
-            lazyVarsAlreadyHaveImplementation = hasImplementation;
-          }
-
-          if (!hasImplementation)
-            TC.completeLazyVarImplementation(prop);
-        }
-      }
-
-      // FIXME: We need to add implicit initializers and dtors when a decl is
-      // touched, because it affects vtable layout.  If you're not defining the
-      // class, you shouldn't have to know what the vtable layout is.
-      if (auto *CD = dyn_cast<ClassDecl>(nominal)) {
-        TC.addImplicitConstructors(CD);
-        TC.addImplicitDestructor(CD);
-      }
+      validateDeclForLayout(TC, nominal);
     }
 
     // Complete any conformances that we used.
@@ -577,6 +617,9 @@ void swift::performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
     if (Options.contains(TypeCheckingFlags::DebugTimeFunctionBodies))
       TC.enableDebugTimeFunctionBodies();
 
+    if (Options.contains(TypeCheckingFlags::DebugTimeExpressions))
+      TC.enableDebugTimeExpressions();
+
     if (Options.contains(TypeCheckingFlags::ForImmediateMode))
       TC.setInImmediateMode(true);
     
@@ -597,7 +640,7 @@ void swift::performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
     // extensions, so we'll need to be smarter here.
     // FIXME: The current source file needs to be handled specially, because of
     // private extensions.
-    SF.forAllVisibleModules([&](Module::ImportedModule import) {
+    SF.forAllVisibleModules([&](ModuleDecl::ImportedModule import) {
       // FIXME: Respect the access path?
       for (auto file : import.second->getFiles()) {
         auto SF = dyn_cast<SourceFile>(file);

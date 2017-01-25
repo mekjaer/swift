@@ -272,6 +272,9 @@ public:
   const bool InferImportAsMember;
   const bool DisableSwiftBridgeAttr;
 
+  bool IsReadingBridgingPCH;
+  llvm::SmallVector<clang::serialization::SubmoduleID, 2> PCHImportedSubmodules;
+
   const Version CurrentVersion;
 
   constexpr static const char * const moduleImportBufferName =
@@ -281,7 +284,7 @@ public:
 
 private:
   /// The Swift lookup table for the bridging header.
-  SwiftLookupTable BridgingHeaderLookupTable;
+  std::unique_ptr<SwiftLookupTable> BridgingHeaderLookupTable;
 
   /// The Swift lookup tables, per module.
   ///
@@ -299,7 +302,7 @@ private:
   unsigned VerifiedImportCounter = 0;
 
   /// \brief Clang compiler invocation.
-  llvm::IntrusiveRefCntPtr<clang::CompilerInvocation> Invocation;
+  std::shared_ptr<clang::CompilerInvocation> Invocation;
 
   /// \brief Clang compiler instance, which is used to actually load Clang
   /// modules.
@@ -478,12 +481,12 @@ public:
   ClangModuleUnit *ImportedHeaderUnit = nullptr;
 
   /// The modules re-exported by imported headers.
-  llvm::SmallVector<Module::ImportedModule, 8> ImportedHeaderExports;
+  llvm::SmallVector<ModuleDecl::ImportedModule, 8> ImportedHeaderExports;
 
   /// The modules that requested imported headers.
   ///
   /// These are used to look up Swift classes forward-declared with \@class.
-  TinyPtrVector<Module *> ImportedHeaderOwners;
+  TinyPtrVector<ModuleDecl *> ImportedHeaderOwners;
 
   /// \brief Clang's objectAtIndexedSubscript: selector.
   clang::Selector objectAtIndexedSubscript;
@@ -499,7 +502,7 @@ public:
 
 private:
   /// Records those modules that we have looked up.
-  llvm::DenseMap<Identifier, Module *> checkedModules;
+  llvm::DenseMap<Identifier, ModuleDecl *> checkedModules;
 
   /// External Decls that we have imported but not passed to the ASTContext yet.
   SmallVector<Decl *, 4> RegisteredExternalDecls;
@@ -594,9 +597,10 @@ public:
   }
 
   /// Imports the given header contents into the Clang context.
-  bool importHeader(Module *adapter, StringRef headerName, SourceLoc diagLoc,
-                    bool trackParsedSymbols,
-                    std::unique_ptr<llvm::MemoryBuffer> contents);
+  bool importHeader(ModuleDecl *adapter, StringRef headerName,
+                    SourceLoc diagLoc, bool trackParsedSymbols,
+                    std::unique_ptr<llvm::MemoryBuffer> contents,
+                    bool implicitImport);
 
   /// \brief Retrieve the imported module that should contain the given
   /// Clang decl.
@@ -807,26 +811,26 @@ public:
                                    bool isStatic, ClangNode ClangN);
 
   /// \brief Retrieve the standard library module.
-  Module *getStdlibModule();
+  ModuleDecl *getStdlibModule();
 
   /// \brief Retrieve the named module.
   ///
   /// \param name The name of the module.
   ///
   /// \returns The named module, or null if the module has not been imported.
-  Module *getNamedModule(StringRef name);
+  ModuleDecl *getNamedModule(StringRef name);
 
   /// \brief Returns the "Foundation" module, if it can be loaded.
   ///
   /// After this has been called, the Foundation module will or won't be loaded
   /// into the ASTContext.
-  Module *tryLoadFoundationModule();
+  ModuleDecl *tryLoadFoundationModule();
 
   /// \brief Returns the "SIMD" module, if it can be loaded.
   ///
   /// After this has been called, the SIMD module will or won't be loaded
   /// into the ASTContext.
-  Module *tryLoadSIMDModule();
+  ModuleDecl *tryLoadSIMDModule();
 
   /// \brief Retrieves the Swift wrapper for the given Clang module, creating
   /// it if necessary.
@@ -834,7 +838,7 @@ public:
                                        const clang::Module *underlying);
 
   /// \brief Constructs a Swift module for the given Clang module.
-  Module *finishLoadingClangModule(ClangImporter &importer,
+  ModuleDecl *finishLoadingClangModule(ClangImporter &importer,
                                    const clang::Module *clangModule,
                                    bool preferAdapter);
 
@@ -854,7 +858,7 @@ public:
   /// \param name The name of the type to find.
   ///
   /// \returns The named type, or null if the type could not be found.
-  Type getNamedSwiftType(Module *module, StringRef name);
+  Type getNamedSwiftType(ModuleDecl *module, StringRef name);
 
   /// \brief Retrieve a specialization of the named Swift type, e.g.,
   /// UnsafeMutablePointer<T>.
@@ -866,7 +870,7 @@ public:
   /// \param args The arguments to use in the specialization.
   ///
   /// \returns The named type, or null if the type could not be found.
-  Type getNamedSwiftTypeSpecialization(Module *module, StringRef name,
+  Type getNamedSwiftTypeSpecialization(ModuleDecl *module, StringRef name,
                                        ArrayRef<Type> args);
 
   /// \brief Retrieve the NSObject type.
@@ -1165,16 +1169,18 @@ namespace importer {
 bool shouldSuppressDeclImport(const clang::Decl *decl);
 
 class SwiftNameLookupExtension : public clang::ModuleFileExtension {
+  std::unique_ptr<SwiftLookupTable> &pchLookupTable;
   LookupTableMap &lookupTables;
   ASTContext &swiftCtx;
   const PlatformAvailability &availability;
   const bool inferImportAsMember;
 
 public:
-  SwiftNameLookupExtension(LookupTableMap &tables, ASTContext &ctx,
+  SwiftNameLookupExtension(std::unique_ptr<SwiftLookupTable> &pchLookupTable,
+                           LookupTableMap &tables, ASTContext &ctx,
                            const PlatformAvailability &avail, bool inferIAM)
-      : lookupTables(tables), swiftCtx(ctx), availability(avail),
-        inferImportAsMember(inferIAM) {}
+      : pchLookupTable(pchLookupTable), lookupTables(tables), swiftCtx(ctx),
+        availability(avail), inferImportAsMember(inferIAM) {}
 
   clang::ModuleFileExtensionMetadata getExtensionMetadata() const override;
   llvm::hash_code hashExtension(llvm::hash_code code) const override;

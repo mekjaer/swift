@@ -113,7 +113,9 @@ static void addReturnValueImpl(SILBasicBlock *RetBB, SILBasicBlock *NewRetBB,
       // Forward the existing return argument to a new BBArg.
       MergedBB = RetBB->split(RetInst->getIterator());
       SILValue OldRetVal = RetInst->getOperand(0);
-      RetInst->setOperand(0, MergedBB->createPHIArgument(OldRetVal->getType()));
+      RetInst->setOperand(
+          0, MergedBB->createPHIArgument(OldRetVal->getType(),
+                                         ValueOwnershipKind::Owned));
       Builder.setInsertionPoint(RetBB);
       Builder.createBranch(Loc, MergedBB, {OldRetVal});
     }
@@ -164,8 +166,8 @@ emitApplyWithRethrow(SILBuilder &Builder,
   {
     // Emit the rethrow logic.
     Builder.emitBlock(ErrorBB);
-    SILValue Error =
-        ErrorBB->createPHIArgument(CanSILFuncTy->getErrorResult().getSILType());
+    SILValue Error = ErrorBB->createPHIArgument(
+        CanSILFuncTy->getErrorResult().getSILType(), ValueOwnershipKind::Owned);
 
     Builder.createBuiltin(Loc,
                           Builder.getASTContext().getIdentifier("willThrow"),
@@ -181,7 +183,7 @@ emitApplyWithRethrow(SILBuilder &Builder,
   Builder.clearInsertionPoint();
   Builder.emitBlock(NormalBB);
   return Builder.getInsertionBB()->createPHIArgument(
-      CanSILFuncTy->getSILResult());
+      CanSILFuncTy->getSILResult(), ValueOwnershipKind::Owned);
 }
 
 /// Emits code to invoke the specified nonpolymorphic CalleeFunc using the
@@ -218,7 +220,9 @@ namespace {
 /// Helper class for emitting code to dispatch to a specialized function.
 class EagerDispatch {
   SILFunction *GenericFunc;
+#if 0
   const SILSpecializeAttr &SA;
+#endif
   const ReabstractionInfo &ReInfo;
 
   SILBuilder Builder;
@@ -229,12 +233,11 @@ public:
   // original generic function.
   EagerDispatch(SILFunction *GenericFunc, const SILSpecializeAttr &SA,
                 const ReabstractionInfo &ReInfo)
-    : GenericFunc(GenericFunc), SA(SA), ReInfo(ReInfo), Builder(*GenericFunc),
-      Loc(GenericFunc->getLocation()) {
-
+      : GenericFunc(GenericFunc), ReInfo(ReInfo), Builder(*GenericFunc),
+        Loc(GenericFunc->getLocation()) {
     Builder.setCurrentDebugScope(GenericFunc->getDebugScope());
   }
-  
+
   void emitDispatchTo(SILFunction *NewFunc);
 
 protected:
@@ -262,8 +265,12 @@ void EagerDispatch::emitDispatchTo(SILFunction *NewFunc) {
   // Iterate over all dependent types in the generic signature, which will match
   // the specialized attribute's substitution list. Visit only
   // SubstitutableTypes, skipping DependentTypes.
+  // TODO: Uncomment when Generics.cpp is updated to use the
+  // new @_specialize attribute for partial specializations.
+#if 0
   auto GenericSig =
     GenericFunc->getLoweredFunctionType()->getGenericSignature();
+
   auto SubIt = SA.getSubstitutions().begin();
   auto SubEnd = SA.getSubstitutions().end();
   for (auto DepTy : GenericSig->getAllDependentTypes()) {
@@ -275,7 +282,9 @@ void EagerDispatch::emitDispatchTo(SILFunction *NewFunc) {
   }
   assert(SubIt == SubEnd && "Too many substitutions.");
   (void) SubEnd;
-
+#else
+  static_cast<void>(FailedTypeCheckBB);
+#endif
   // 2. Convert call arguments, casting and adjusting for calling convention.
 
   SmallVector<SILValue, 8> CallArgs;
@@ -426,6 +435,9 @@ public:
 };
 } // end anonymous namespace
 
+    // TODO: Uncomment when Generics.cpp is updated to use the
+    // new @_specialize attribute for partial specializations.
+#if 0
 /// Specializes a generic function for a concrete type list.
 static SILFunction *eagerSpecialize(SILFunction *GenericFunc,
                                     const SILSpecializeAttr &SA,
@@ -445,6 +457,9 @@ static SILFunction *eagerSpecialize(SILFunction *GenericFunc,
         SA.print(dbgs()); dbgs() << "\n");
   
   // Create a specialized function.
+  // TODO: Uncomment when Generics.cpp is updated to use the
+  // new @_specialize attribute for partial specializations.
+#if 0
   GenericFuncSpecializer
         FuncSpecializer(GenericFunc, SA.getSubstitutions(),
                         GenericFunc->isFragile(), ReInfo);
@@ -452,9 +467,12 @@ static SILFunction *eagerSpecialize(SILFunction *GenericFunc,
   SILFunction *NewFunc = FuncSpecializer.trySpecialization();
   if (!NewFunc)
     DEBUG(dbgs() << "  Failed. Cannot specialize function.\n");
-
   return NewFunc;
+#else
+  return nullptr;
+#endif
 }
+#endif
 
 /// Run the pass.
 void EagerSpecializerTransform::run() {
@@ -478,6 +496,9 @@ void EagerSpecializerTransform::run() {
     SmallVector<ReabstractionInfo, 4> ReInfoVec;
     ReInfoVec.reserve(F.getSpecializeAttrs().size());
 
+    // TODO: Uncomment when Generics.cpp is updated to use the
+    // new @_specialize attribute for partial specializations.
+#if 0
     for (auto *SA : F.getSpecializeAttrs()) {
       ReInfoVec.emplace_back(&F, SA->getSubstitutions());
       auto *NewFunc = eagerSpecialize(&F, *SA, ReInfoVec.back());
@@ -493,6 +514,7 @@ void EagerSpecializerTransform::run() {
         EagerDispatch(&F, *SA, ReInfo).emitDispatchTo(NewFunc);
       }
     });
+#endif
     // As specializations are created, the attributes should be removed.
     F.clearSpecializeAttrs();
   }

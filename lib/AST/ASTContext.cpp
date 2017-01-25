@@ -31,6 +31,7 @@
 #include "swift/AST/RawComment.h"
 #include "swift/AST/SILLayout.h"
 #include "swift/AST/TypeCheckerDebugConsumer.h"
+#include "swift/Basic/Compiler.h"
 #include "swift/Basic/Fallthrough.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/StringExtras.h"
@@ -275,8 +276,16 @@ struct ASTContext::Implementation {
     ~Arena() {
       for (auto &conformance : SpecializedConformances)
         conformance.~SpecializedProtocolConformance();
+      // Work around MSVC warning: local variable is initialized but
+      // not referenced.
+#if SWIFT_COMPILER_IS_MSVC
+#pragma warning (disable: 4189)
+#endif
       for (auto &conformance : InheritedConformances)
         conformance.~InheritedProtocolConformance();
+#if SWIFT_COMPILER_IS_MSVC
+#pragma warning (default: 4189)
+#endif
 
       // Call the normal conformance destructors last since they could be
       // referenced by the other conformance types.
@@ -287,7 +296,7 @@ struct ASTContext::Implementation {
     size_t getTotalMemory() const;
   };
 
-  llvm::DenseMap<Module*, ModuleType*> ModuleTypes;
+  llvm::DenseMap<ModuleDecl*, ModuleType*> ModuleTypes;
   llvm::DenseMap<std::pair<unsigned, unsigned>, GenericTypeParamType *>
     GenericParamTypes;
   llvm::FoldingSet<GenericFunctionType> GenericFunctionTypes;
@@ -375,8 +384,8 @@ ConstraintCheckerArenaRAII::~ConstraintCheckerArenaRAII() {
     (ASTContext::Implementation::ConstraintSolverArena *)Data);
 }
 
-static Module *createBuiltinModule(ASTContext &ctx) {
-  auto M = Module::create(ctx.getIdentifier("Builtin"), ctx);
+static ModuleDecl *createBuiltinModule(ASTContext &ctx) {
+  auto M = ModuleDecl::create(ctx.getIdentifier("Builtin"), ctx);
   M->addFile(*new (ctx) BuiltinUnit(*M));
   return M;
 }
@@ -477,7 +486,7 @@ Identifier ASTContext::getIdentifier(StringRef Str) const {
 void ASTContext::lookupInSwiftModule(
                    StringRef name,
                    SmallVectorImpl<ValueDecl *> &results) const {
-  Module *M = getStdlibModule();
+  ModuleDecl *M = getStdlibModule();
   if (!M)
     return;
 
@@ -536,6 +545,8 @@ EnumDecl *ASTContext::getOptionalDecl(OptionalTypeKind kind) const {
   case OTK_Optional:
     return getOptionalDecl();
   }
+
+  llvm_unreachable("Unhandled OptionalTypeKind in switch.");
 }
 
 static EnumElementDecl *findEnumElement(EnumDecl *e, Identifier name) {
@@ -676,7 +687,7 @@ StructDecl *ASTContext::getObjCBoolDecl() const {
   if (!Impl.ObjCBoolDecl) {
     SmallVector<ValueDecl *, 1> results;
     auto *Context = const_cast<ASTContext *>(this);
-    if (Module *M = Context->getModuleByName(Id_ObjectiveC.str())) {
+    if (ModuleDecl *M = Context->getModuleByName(Id_ObjectiveC.str())) {
       M->lookupValue({ }, getIdentifier("ObjCBool"), NLKind::UnqualifiedLookup,
                      results);
       for (auto result : results) {
@@ -695,7 +706,7 @@ StructDecl *ASTContext::getObjCBoolDecl() const {
 
 ClassDecl *ASTContext::getNSErrorDecl() const {
   if (!Impl.NSErrorDecl) {
-    if (Module *M = getLoadedModule(Id_Foundation)) {
+    if (ModuleDecl *M = getLoadedModule(Id_Foundation)) {
       // Note: use unqualified lookup so we find NSError regardless of
       // whether it's defined in the Foundation module or the Clang
       // Foundation module it imports.
@@ -728,7 +739,7 @@ ProtocolDecl *ASTContext::getProtocol(KnownProtocolKind kind) const {
   if (kind == KnownProtocolKind::BridgedNSError ||
       kind == KnownProtocolKind::BridgedStoredNSError ||
       kind == KnownProtocolKind::ErrorCodeProtocol) {
-    Module *foundation =
+    ModuleDecl *foundation =
         const_cast<ASTContext *>(this)->getLoadedModule(Id_Foundation);
     if (!foundation)
       return nullptr;
@@ -1184,7 +1195,7 @@ void ASTContext::verifyAllLoadedModules() const {
     loader->verifyAllModules();
 
   for (auto &topLevelModulePair : LoadedModules) {
-    Module *M = topLevelModulePair.second;
+    ModuleDecl *M = topLevelModulePair.second;
     assert(!M->getFiles().empty() || M->failedToLoad());
   }
 #endif
@@ -1194,7 +1205,7 @@ ClangModuleLoader *ASTContext::getClangModuleLoader() const {
   return Impl.TheClangModuleLoader;
 }
 
-static void recordKnownProtocol(Module *Stdlib, StringRef Name,
+static void recordKnownProtocol(ModuleDecl *Stdlib, StringRef Name,
                                 KnownProtocolKind Kind) {
   Identifier ID = Stdlib->getASTContext().getIdentifier(Name);
   UnqualifiedLookup Lookup(ID, Stdlib, nullptr, /*IsKnownPrivate=*/true,
@@ -1204,13 +1215,13 @@ static void recordKnownProtocol(Module *Stdlib, StringRef Name,
     Proto->setKnownProtocolKind(Kind);
 }
 
-void ASTContext::recordKnownProtocols(Module *Stdlib) {
+void ASTContext::recordKnownProtocols(ModuleDecl *Stdlib) {
 #define PROTOCOL_WITH_NAME(Id, Name) \
   recordKnownProtocol(Stdlib, Name, KnownProtocolKind::Id);
 #include "swift/AST/KnownProtocols.def"
 }
 
-Module *ASTContext::getLoadedModule(
+ModuleDecl *ASTContext::getLoadedModule(
     ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) const {
   assert(!ModulePath.empty());
 
@@ -1221,7 +1232,7 @@ Module *ASTContext::getLoadedModule(
   return nullptr;
 }
 
-Module *ASTContext::getLoadedModule(Identifier ModuleName) const {
+ModuleDecl *ASTContext::getLoadedModule(Identifier ModuleName) const {
   return LoadedModules.lookup(ModuleName);
 }
 
@@ -1241,7 +1252,7 @@ ArchetypeBuilder *ASTContext::getOrCreateArchetypeBuilder(
     return known->second.get();
 
   // Create a new archetype builder with the given signature.
-  auto builder = new ArchetypeBuilder(*mod);
+  auto builder = new ArchetypeBuilder(*this, LookUpConformanceInModule(mod));
   builder->addGenericSignature(sig);
 
   // Store this archetype builder (no generic environment yet).
@@ -1254,7 +1265,7 @@ ArchetypeBuilder *ASTContext::getOrCreateArchetypeBuilder(
 GenericEnvironment *ASTContext::getOrCreateCanonicalGenericEnvironment(
                                                     ArchetypeBuilder *builder) {
   auto known = Impl.CanonicalGenericEnvironments.find(builder);
-  if (known != Impl.CanonicalGenericEnvironments.find(builder))
+  if (known != Impl.CanonicalGenericEnvironments.end())
     return known->second;
 
   auto sig = builder->getGenericSignature();
@@ -1277,7 +1288,7 @@ bool ASTContext::canImportModule(std::pair<Identifier, SourceLoc> ModulePath) {
   return false;
 }
 
-Module *
+ModuleDecl *
 ASTContext::getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) {
   assert(!ModulePath.empty());
 
@@ -1286,7 +1297,7 @@ ASTContext::getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) {
 
   auto moduleID = ModulePath[0];
   for (auto &importer : Impl.ModuleLoaders) {
-    if (Module *M = importer->loadModule(moduleID.second, ModulePath)) {
+    if (ModuleDecl *M = importer->loadModule(moduleID.second, ModulePath)) {
       if (ModulePath.size() == 1 &&
           (ModulePath[0].first == StdlibModuleName ||
            ModulePath[0].first == Id_Foundation))
@@ -1298,7 +1309,7 @@ ASTContext::getModule(ArrayRef<std::pair<Identifier, SourceLoc>> ModulePath) {
   return nullptr;
 }
 
-Module *ASTContext::getModuleByName(StringRef ModuleName) {
+ModuleDecl *ASTContext::getModuleByName(StringRef ModuleName) {
   SmallVector<std::pair<Identifier, SourceLoc>, 4>
   AccessPath;
   while (!ModuleName.empty()) {
@@ -1309,7 +1320,7 @@ Module *ASTContext::getModuleByName(StringRef ModuleName) {
   return getModule(AccessPath);
 }
 
-Module *ASTContext::getStdlibModule(bool loadIfAbsent) {
+ModuleDecl *ASTContext::getStdlibModule(bool loadIfAbsent) {
   if (TheStdlibModule)
     return TheStdlibModule;
 
@@ -1619,8 +1630,8 @@ namespace {
     bool operator()(ValueDecl *lhs, ValueDecl *rhs) const {
       // If the declarations come from different modules, order based on the
       // module.
-      Module *lhsModule = lhs->getDeclContext()->getParentModule();
-      Module *rhsModule = rhs->getDeclContext()->getParentModule();
+      ModuleDecl *lhsModule = lhs->getDeclContext()->getParentModule();
+      ModuleDecl *rhsModule = rhs->getDeclContext()->getParentModule();
       if (lhsModule != rhsModule) {
         return lhsModule->getName().str() < rhsModule->getName().str();
       }
@@ -1714,6 +1725,8 @@ std::pair<unsigned, DeclName> swift::getObjCMethodDiagInfo(
     // Normal method.
     return { 4, func->getFullName() };
   }
+
+  llvm_unreachable("Unhandled AccessorKind in switch.");
 }
 
 bool swift::fixDeclarationName(InFlightDiagnostic &diag, ValueDecl *decl,
@@ -1865,7 +1878,7 @@ void ASTContext::diagnoseAttrsRequiringFoundation(SourceFile &SF) {
       !LangOpts.EnableObjCAttrRequiresFoundation)
     return;
 
-  SF.forAllVisibleModules([&](Module::ImportedModule import) {
+  SF.forAllVisibleModules([&](ModuleDecl::ImportedModule import) {
     if (import.second->getName() == Id_Foundation)
       ImportsFoundationModule = true;
   });
@@ -2857,7 +2870,7 @@ ExistentialMetatypeType::ExistentialMetatypeType(Type T,
   }
 }
 
-ModuleType *ModuleType::get(Module *M) {
+ModuleType *ModuleType::get(ModuleDecl *M) {
   ASTContext &C = M->getASTContext();
 
   ModuleType *&Entry = C.Impl.ModuleTypes[M];
@@ -3429,13 +3442,13 @@ CanArchetypeType ArchetypeType::getOpened(Type existential,
 
   auto arena = AllocationArena::Permanent;
   void *mem = ctx.Allocate(
-                totalSizeToAlloc<ProtocolDecl *, Type, UUID>(conformsTo.size(),
-                                                             superclass ? 1 : 0,
-                                                             1),
-                alignof(ArchetypeType), arena);
+      totalSizeToAlloc<ProtocolDecl *, Type, LayoutConstraint, UUID>(
+        conformsTo.size(), superclass ? 1 : 0, 0, 1),
+      alignof(ArchetypeType), arena);
 
-  auto result = ::new (mem) ArchetypeType(ctx, existential, conformsTo,
-                                          superclass, *knownID);
+  auto result =
+      ::new (mem) ArchetypeType(ctx, existential, conformsTo, superclass,
+                                existential->getLayoutConstraint(), *knownID);
   openedExistentialArchetypes[*knownID] = result;
 
   return CanArchetypeType(result);
@@ -3505,7 +3518,10 @@ void GenericSignature::Profile(llvm::FoldingSetNodeID &ID,
 
   for (auto &reqt : requirements) {
     ID.AddPointer(reqt.getFirstType().getPointer());
-    ID.AddPointer(reqt.getSecondType().getPointer());
+    if (reqt.getKind() != RequirementKind::Layout)
+      ID.AddPointer(reqt.getSecondType().getPointer());
+    else
+      ID.AddPointer(reqt.getLayoutConstraint().getPointer());
     ID.AddInteger(unsigned(reqt.getKind()));
   }
 }
@@ -3607,7 +3623,7 @@ DeclName::DeclName(ASTContext &C, Identifier baseName,
 /// Find the implementation of the named type in the given module.
 static NominalTypeDecl *findUnderlyingTypeInModule(ASTContext &ctx, 
                                                    Identifier name,
-                                                   Module *module) {
+                                                   ModuleDecl *module) {
   // Find all of the declarations with this name in the Swift module.
   SmallVector<ValueDecl *, 1> results;
   module->lookupValue({ }, name, NLKind::UnqualifiedLookup, results);
@@ -3633,7 +3649,7 @@ ASTContext::getForeignRepresentationInfo(NominalTypeDecl *nominal,
   if (Impl.ForeignRepresentableCache.empty()) {
     // Local function to add a type with the given name and module as
     // trivially-representable.
-    auto addTrivial = [&](Identifier name, Module *module,
+    auto addTrivial = [&](Identifier name, ModuleDecl *module,
                           bool allowOptional = false) {
       if (auto type = findUnderlyingTypeInModule(*this, name, module)) {
         auto info = ForeignRepresentationInfo::forTrivial();
@@ -3760,6 +3776,8 @@ ASTContext::getForeignRepresentationInfo(NominalTypeDecl *nominal,
   case ForeignLanguage::ObjectiveC:
     return entry;
   }
+
+  llvm_unreachable("Unhandled ForeignLanguage in switch.");
 }
 
 bool ASTContext::isTypeBridgedInExternalModule(

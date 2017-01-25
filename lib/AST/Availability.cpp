@@ -91,7 +91,10 @@ createAvailableAttr(PlatformKind Platform,
   return new (Context) AvailableAttr(
       SourceLoc(), SourceRange(), Platform,
       /*Message=*/StringRef(),
-      /*Rename=*/StringRef(), Introduced, Deprecated, Obsoleted,
+      /*Rename=*/StringRef(),
+        Introduced, /*IntroducedRange=*/SourceRange(),
+        Deprecated, /*DeprecatedRange=*/SourceRange(),
+        Obsoleted, /*ObsoletedRange=*/SourceRange(),
       Inferred.PlatformAgnostic, /*Implicit=*/true);
 }
 
@@ -188,7 +191,7 @@ public:
   AvailabilityInferenceTypeWalker(ASTContext &AC) : AC(AC) {}
 
   Action walkToTypePre(Type ty) override {
-    if (auto *nominalDecl = ty->getCanonicalType()->getAnyNominal()) {
+    if (auto *nominalDecl = ty->getAnyNominal()) {
       AvailabilityInfo.intersectWith(
           AvailabilityInference::availableRange(nominalDecl, AC));
     }
